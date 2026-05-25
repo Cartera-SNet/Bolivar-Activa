@@ -596,16 +596,15 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                         }}
                         let iconoPdf = null;
                         const candidatosPdf = contenedor.querySelectorAll('img, svg, i, div');
-                        for (const el of candidatosPdf) {
+                        for (const el of candidatosPdf) {{
                             const src = el.getAttribute('src') || '';
                             const lbl = el.getAttribute('aria-label') || '';
                             const cls = el.className || '';
                             if (src.toLowerCase().includes('pdf') || lbl.toLowerCase().includes('pdf') ||
-                                cls.toLowerCase().includes('pdf') || cls.toLowerCase().includes('file')) {
+                                cls.toLowerCase().includes('pdf') || cls.toLowerCase().includes('file')) {{
                                 iconoPdf = el; break;
-                            }
-                        }
-                        // iconoPdf listo
+                            }}
+                        }}
                         if (iconoPdf) {{
                             iconoPdf.click();
                             return {{ ok: true, metodo: 'icono_pdf' }};
@@ -661,16 +660,15 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                                         }}
                                         let iconoPdf = null;
                                         const candidatosPdf2 = contenedor.querySelectorAll('img, svg, i, div');
-                                        for (const el of candidatosPdf2) {
+                                        for (const el of candidatosPdf2) {{
                                             const src = el.getAttribute('src') || '';
                                             const lbl = el.getAttribute('aria-label') || '';
                                             const cls = el.className || '';
                                             if (src.toLowerCase().includes('pdf') || lbl.toLowerCase().includes('pdf') ||
-                                                cls.toLowerCase().includes('pdf')) {
+                                                cls.toLowerCase().includes('pdf')) {{
                                                 iconoPdf = el; break;
-                                            }
-                                        }
-                                        // iconoPdf listo
+                                            }}
+                                        }}
                                         if (iconoPdf) {{
                                             iconoPdf.click();
                                             return {{ ok: true, metodo: 'icono_pdf', texto: txt }};
@@ -1187,7 +1185,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 permitidas = job_state.get("facturas_permitidas", [])
             if permitidas:
                 original_count = len(facturas_pendientes)
-                facturas_pendientes = [fac for fac in facturas_pendientes if fac]['num'] in permitidas]
+                facturas_pendientes = [fac for fac in facturas_pendientes if fac['num'] in permitidas]
                 log(f"📋 Filtro activo: {len(facturas_pendientes)} de {original_count} facturas permitidas.")
 
             log(f"📋 Facturas pendientes: {len(facturas_pendientes)}")
