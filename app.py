@@ -1209,48 +1209,86 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
                 return
 
-            for idx, fac in enumerate(facturas_pendientes, 1):
-                if job_state.get("stopping"):
-                    log("🛑 Proceso detenido por el usuario.")
-                    if not zip_parcial_generado:
-                        generar_zip_parcial()
-                        zip_parcial_generado = True
+            # ── Función interna: procesar una lista de facturas en la sesión activa ──
+            def _procesar_lista(lista, intento_num):
+                fallidas = []
+                for idx, fac in enumerate(lista, 1):
+                    if job_state.get("stopping"):
+                        log("🛑 Proceso detenido por el usuario.")
+                        if not zip_parcial_generado:
+                            generar_zip_parcial()
+                        return None
+                    log(f"[Intento {intento_num}][{idx}/{len(lista)}] Factura {fac['num']} ({fac['tipo']})...")
+                    try:
+                        _download_factura(page, context, data_frame, fac, dl_dir, ips_nombre_actual)
+                        with job_lock:
+                            job_state["stats"]["descargadas"] += 1
+                        completadas.add(fac['num'])
+                        guardar_progreso(ips_dir, completadas)
+                        log(f"  ✅ Descargada: {fac['num']}", "success")
+                    except Exception as e:
+                        with job_lock:
+                            if intento_num == 1:
+                                job_state["stats"]["errores"] += 1
+                            error_msg = str(e)
+                            if "seleccionar el archivo" in error_msg:
+                                if fac['tipo'] == 'auditada':
+                                    error_msg = f"No se encontró soporte Envios_D ni Carta de Objecion"
+                                else:
+                                    error_msg = f"No se encontró soporte ActaDevolucion ni Carta de Objecion"
+                        log(f"  ⚠️ Error intento {intento_num}: {error_msg}", "error")
+                        _cerrar_traza_factura(page)
+                        time.sleep(1)
+                        fallidas.append(fac)
+                return fallidas
+
+            # ── Primer pase ──
+            MAX_REINTENTOS = 5
+            fallidas = _procesar_lista(facturas_pendientes, 1)
+
+            # ── Reintentos automáticos ──
+            if fallidas is None:
+                browser.close()
+                return
+
+            intento = 2
+            while fallidas and intento <= MAX_REINTENTOS and not job_state.get("stopping"):
+                log(f"🔄 {len(fallidas)} factura(s) con error. Reintentando automáticamente ({intento}/{MAX_REINTENTOS})...", "warn")
+                time.sleep(3)
+                nums_fallidas = {f['num'] for f in fallidas}
+                with job_lock:
+                    job_state["errores_detalle"] = [e for e in job_state["errores_detalle"] if e["factura"] not in nums_fallidas]
+                fallidas_nuevo = _procesar_lista(fallidas, intento)
+                if fallidas_nuevo is None:
+                    browser.close()
                     return
-                log(f"[{idx}/{len(facturas_pendientes)}] Factura {fac['num']} ({fac['tipo']})...")
-                try:
-                    _download_factura(page, context, data_frame, fac, dl_dir, ips_nombre_actual)
-                    with job_lock:
-                        job_state["stats"]["descargadas"] += 1
-                    completadas.add(fac['num'])
-                    guardar_progreso(ips_dir, completadas)
-                    log(f"  ✅ Descargada: {fac['num']}", "success")
-                except Exception as e:
-                    with job_lock:
-                        job_state["stats"]["errores"] += 1
-                        error_msg = str(e)
-                        if "seleccionar el archivo" in error_msg:
-                            if fac['tipo'] == 'auditada':
-                                error_msg = f"No se encontró soporte Envios_D ni Carta de Objecion"
-                            else:
-                                error_msg = f"No se encontró soporte ActaDevolucion ni Carta de Objecion"
-                        error_info = {
-                            "factura": fac['num'],
-                            "estado": fac['estado'],
-                            "error": error_msg,
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        }
-                        try:
-                            errores_dir = ips_dir / "Errores"
-                            errores_dir.mkdir(parents=True, exist_ok=True)
-                            cap_path = errores_dir / f"ERROR_{fac['num']}.png"
-                            page.screenshot(path=str(cap_path))
-                            error_info["captura"] = str(cap_path)
-                        except:
-                            error_info["captura"] = ""
-                        job_state["errores_detalle"].append(error_info)
-                    log(f"  ⚠️ Error: {error_msg}", "error")
-                    _cerrar_traza_factura(page)
-                    time.sleep(1)
+                fallidas = fallidas_nuevo
+                intento += 1
+
+            # ── Registrar errores persistentes al final ──
+            if fallidas:
+                log(f"⛔ {len(fallidas)} factura(s) no pudieron descargarse tras {MAX_REINTENTOS} intentos.", "error")
+                with job_lock:
+                    for fac in fallidas:
+                        nums_existentes = {e["factura"] for e in job_state["errores_detalle"]}
+                        if fac['num'] not in nums_existentes:
+                            error_info = {
+                                "factura": fac['num'],
+                                "estado": fac['estado'],
+                                "error": f"Error persistente tras {MAX_REINTENTOS} intentos automáticos",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "captura": ""
+                            }
+                            try:
+                                errores_dir = ips_dir / "Errores"
+                                errores_dir.mkdir(parents=True, exist_ok=True)
+                                cap_path = errores_dir / f"ERROR_PERSISTENTE_{fac['num']}.png"
+                                page.screenshot(path=str(cap_path))
+                                error_info["captura"] = str(cap_path)
+                            except:
+                                pass
+                            job_state["errores_detalle"].append(error_info)
+                    job_state["stats"]["errores"] = len(job_state["errores_detalle"])
 
             browser.close()
             with job_lock:
@@ -1258,7 +1296,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 errores = job_state["errores_detalle"].copy()
             generar_reporte_excel(dl_dir, periodo, ips_nombre_actual, exitosas, errores)
             crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
-            log("🎉 Proceso completado.")
+            if fallidas:
+                log(f"⚠️ Proceso completado con {len(fallidas)} factura(s) con error persistente. Ver Excel para detalle.")
+            else:
+                log("🎉 Proceso completado sin errores.")
 
     except Exception as e:
         if not job_state.get("stopping"):
@@ -1430,16 +1471,18 @@ def delete_all_files():
     try:
         eliminados = 0
         for item in list(folder.iterdir()):
-            if item.is_file():
+            if item.is_file() and item.name != "progreso.json":
                 item.unlink()
                 eliminados += 1
             elif item.is_dir():
-                shutil.rmtree(item)
-                eliminados += 1
-        log(f"🗑️ Archivos eliminados: {eliminados} elemento(s) en '{folder}'")
-        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} elemento(s)", "eliminados": eliminados})
+                for sub in list(item.iterdir()):
+                    if sub.is_file() and sub.name != "progreso.json":
+                        sub.unlink()
+                        eliminados += 1
+        log(f"🗑️ Soportes eliminados: {eliminados} archivo(s) en '{folder}' (progreso conservado)")
+        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} soporte(s). El progreso se conservó.", "eliminados": eliminados})
     except Exception as e:
-        log(f"⚠️ Error al eliminar archivos: {e}", "error")
+        log(f"⚠️ Error al eliminar soportes: {e}", "error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/downloads/<path:filename>")
@@ -1466,8 +1509,16 @@ def upload_facturas():
         filename = file.filename.lower()
         facturas = []
         if filename.endswith('.csv'):
-            content = file.read().decode('utf-8')
-            reader = csv.DictReader(content.splitlines())
+            raw = file.read()
+            for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+                try:
+                    csv_text = raw.decode(enc)
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            else:
+                csv_text = raw.decode('latin-1', errors='replace')
+            reader = csv.DictReader(csv_text.splitlines())
             for row in reader:
                 for col, val in row.items():
                     if 'factura' in col.lower():
