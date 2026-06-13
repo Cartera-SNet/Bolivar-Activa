@@ -1003,7 +1003,7 @@ async function verProgreso() {
     document.getElementById("modalInfo").textContent = "Cargando...";
     modal.style.display = "flex";
     const d = await (await fetch(`/api/progreso?periodo=${encodeURIComponent(per)}`)).json();
-    document.getElementById("modal_info").textContent = d.ok ? `${d.cantidad} facturas completadas` : d.error || "Sin datos.";
+    document.getElementById("modalInfo").textContent = d.ok ? `${d.cantidad} facturas completadas (IPS: ${d.ips || "-"})` : d.error || "Sin datos.";
     if (d.completadas) d.completadas.forEach(f => { const li = document.createElement("li"); li.textContent = f; document.getElementById("modalLista").appendChild(li); });
 }
 
