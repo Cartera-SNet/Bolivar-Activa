@@ -307,10 +307,31 @@ def _cerrar_traza_factura(page):
         except:
             continue
 
-def _extraer_nombre_ips(page, target_frame):
+def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
+    """
+    Orden de prioridad:
+    0. NIT extraído del nombre de usuario (ej: BOL760010961401 → 760010961401)
+    1. Carpeta previa del mismo período (reutiliza nombre para leer progreso)
+    2. NIT encontrado en el HTML
+    3. Nombre por palabras clave
+    4. Fallback: IPS_DESCONOCIDA
+    """
+    # 0. NIT del usuario directo
+    if nit_usuario and nit_usuario in MAPA_IPS:
+        nombre = MAPA_IPS[nit_usuario]
+        log(f"    🏥 IPS identificada por NIT del usuario ({nit_usuario}) -> {nombre}")
+        return nombre
+
+    # 1. Reutilizar carpeta previa si existe (para no romper el progreso)
+    if current_dl_dir and current_dl_dir.exists():
+        for nombre_mapa in MAPA_IPS.values():
+            if (current_dl_dir / nombre_mapa).exists():
+                log(f"    📂 Carpeta previa encontrada, reutilizando nombre: {nombre_mapa}")
+                return nombre_mapa
+
     def _buscar_en_frame(frame):
         try:
-            nit = frame.evaluate("() => { const match = document.body.innerText.match(/NIT\\s*:\\s*([\\d\\-\\s]+)/i; if(match) return match[1].replace(/[^0-9]/g, ''); return ''; }").strip()
+            nit = frame.evaluate("() => { const match = document.body.innerText.match(/NIT\\s*:\\s*([\\d\\-\\s]+)/i); if(match) return match[1].replace(/[^0-9]/g, ''); return ''; }").strip()
             return nit if nit else ""
         except:
             return ""
@@ -322,14 +343,23 @@ def _extraer_nombre_ips(page, target_frame):
                 if nit:
                     break
     log(f"    🔍 NIT detectado: {nit}")
+
+    # Probar NIT del HTML contra el mapa
     if nit and nit in MAPA_IPS:
         nombre = MAPA_IPS[nit]
         log(f"    🏥 Nombre obtenido del mapa: {nombre}")
         return nombre
+
+    # Probar NIT del usuario contra el mapa (segundo intento)
+    if nit_usuario and nit_usuario in MAPA_IPS:
+        nombre = MAPA_IPS[nit_usuario]
+        log(f"    🏥 IPS por NIT del usuario: {nombre}")
+        return nombre
+
     js_nombre = """
         () => {
-            const keywords = ["IPS","CLINICA","HOSPITAL","CENTRO","FUNDACIÓN","URGENCIAS","SALUD","ODONTOTRANS","URGETRAUMA","CORDIALIDAD"];
-            for (const el of document.querySelectorAll('h1,h2,h3,h4,p,div')) {
+            const keywords = ["IPS","CLINICA","HOSPITAL","CENTRO","FUNDACIÓN","URGENCIAS","SALUD","ODONTOTRANS","URGETRAUMA","CORDIALIDAD","INVERSIONES","MEDICAS"];
+            for (const el of document.querySelectorAll('h1,h2,h3,h4,p,div,span')) {
                 let txt = el.innerText.trim();
                 if (txt.length > 5 && txt.length < 100 && keywords.some(kw => txt.toUpperCase().includes(kw))) return txt;
             }
@@ -374,28 +404,51 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         () => {{
             const botId = '{bot_id}';
             const targetDigits = '{num_solo_digitos}';
-            const fila = document.querySelector(`[data-bot-row-id="${{botId}}"]`);
-            if (!fila) return {{ ok: false, reason: "fila_no_encontrada" }};
-            fila.scrollIntoView({{block: 'center'}});
+
             function dispararClick(el) {{
                 if (!el) return false;
                 try {{ el.click(); }} catch (e) {{}}
                 try {{ el.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}})); }} catch (e) {{}}
                 return true;
             }}
-            const candidatos = [];
-            for (const a of fila.querySelectorAll('a')) {{
-                const t = (a.textContent || '').trim();
-                if (t.replace(/\\D/g, '') === targetDigits || candidatos.length === 0)
-                    candidatos.push({{ tipo: 'a', el: a }});
+
+            function clickearFila(fila, metodo) {{
+                fila.scrollIntoView({{block: 'center'}});
+                const candidatos = [];
+                for (const a of fila.querySelectorAll('a')) {{
+                    const t = (a.textContent || '').trim();
+                    if (t.replace(/\\D/g, '') === targetDigits || candidatos.length === 0)
+                        candidatos.push(a);
+                }}
+                for (const el of fila.querySelectorAll('[onclick]')) {{
+                    if (!candidatos.includes(el)) candidatos.push(el);
+                }}
+                candidatos.push(fila);
+                for (const td of fila.querySelectorAll('td')) candidatos.push(td);
+                for (const c of candidatos) dispararClick(c);
+                return {{ ok: true, clickedWith: metodo, candidates: candidatos.length }};
             }}
-            for (const el of fila.querySelectorAll('[onclick]')) {{
-                if (!candidatos.find(c => c.el === el)) candidatos.push({{ tipo: 'onclick', el }});
+
+            let fila = botId ? document.querySelector(`[data-bot-row-id="${{botId}}"]`) : null;
+            if (fila) return clickearFila(fila, 'botId');
+
+            for (const row of document.querySelectorAll('tr')) {{
+                for (const a of row.querySelectorAll('a')) {{
+                    if ((a.textContent || '').replace(/\\D/g, '') === targetDigits) {{
+                        return clickearFila(row, 'numero_factura');
+                    }}
+                }}
             }}
-            candidatos.push({{ tipo: 'fila', el: fila }});
-            for (const td of fila.querySelectorAll('td')) candidatos.push({{ tipo: 'td', el: td }});
-            for (const c of candidatos) dispararClick(c.el);
-            return {{ ok: true, clickedWith: 'cascada', candidates: candidatos.length }};
+
+            for (const row of document.querySelectorAll('tr')) {{
+                for (const td of row.querySelectorAll('td')) {{
+                    if ((td.textContent || '').replace(/\\D/g, '') === targetDigits) {{
+                        return clickearFila(row, 'celda_numero');
+                    }}
+                }}
+            }}
+
+            return {{ ok: false, reason: "fila_no_encontrada" }};
         }}
     """
     result = None
@@ -1051,7 +1104,12 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 raise Exception(f"No se pudo localizar el período '{periodo}' tras 60s.")
 
             log("🏥 Obteniendo nombre de la IPS...")
-            ips_nombre_actual = _extraer_nombre_ips(page, target_frame)
+            # Extraer NIT del usuario (ej: BOL760010961401 → 760010961401)
+            nit_from_usuario = re.search(r'(\d{9,12})', usuario)
+            nit_from_usuario = nit_from_usuario.group(1) if nit_from_usuario else None
+            if nit_from_usuario:
+                log(f"    🔑 NIT extraído del usuario '{usuario}': {nit_from_usuario}")
+            ips_nombre_actual = _extraer_nombre_ips(page, target_frame, nit_usuario=nit_from_usuario)
             current_ips_nombre = ips_nombre_actual
 
             if job_state.get("stopping"): return
