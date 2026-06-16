@@ -322,13 +322,6 @@ def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
         log(f"    🏥 IPS identificada por NIT del usuario ({nit_usuario}) -> {nombre}")
         return nombre
 
-    # 1. Reutilizar carpeta previa si existe (para no romper el progreso)
-    if current_dl_dir and current_dl_dir.exists():
-        for nombre_mapa in MAPA_IPS.values():
-            if (current_dl_dir / nombre_mapa).exists():
-                log(f"    📂 Carpeta previa encontrada, reutilizando nombre: {nombre_mapa}")
-                return nombre_mapa
-
     def _buscar_en_frame(frame):
         try:
             nit = frame.evaluate("() => { const match = document.body.innerText.match(/NIT\\s*:\\s*([\\d\\-\\s]+)/i); if(match) return match[1].replace(/[^0-9]/g, ''); return ''; }").strip()
@@ -1039,6 +1032,33 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 page.wait_for_selector("text=BI IPS, text=Inteligencia de Negocio", timeout=10000)
             except:
                 pass
+            # ── Cerrar popups/alertas inesperados (mantenimiento, cookies, etc.) ──
+            def _cerrar_popups():
+                try:
+                    page.evaluate("""() => {
+                        const selectores = [
+                            '.modal', '.dialog', '.alert', '.popup', '.overlay',
+                            '[role="dialog"]', '[role="alertdialog"]',
+                            '.ui-dialog', '.sweet-alert', '.swal2-container'
+                        ];
+                        for (const sel of selectores) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                if (el.offsetParent === null) continue;
+                                const btns = [...el.querySelectorAll('button, a, input[type="button"]')];
+                                const close = btns.find(b => /cerrar|close|aceptar|ok|entendido|continuar|×|✕/i.test(b.textContent || b.getAttribute('aria-label') || b.value || ''));
+                                if (close) { close.click(); return true; }
+                            }
+                        }
+                        return false;
+                    }""")
+                except:
+                    pass
+                try:
+                    page.keyboard.press("Escape")
+                except:
+                    pass
+
+            _cerrar_popups()
             log("✅ Sesión iniciada correctamente.")
             if job_state.get("stopping"): return
 
@@ -1091,6 +1111,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 page.wait_for_load_state("networkidle", timeout=8000)
             except:
                 pass
+            _cerrar_popups()
             log("✅ Módulo BI IPS abierto. Buscando período...")
             target_frame = None
             for i in range(120):
@@ -1306,6 +1327,24 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 return
 
             # ── Función interna: procesar una lista de facturas en la sesión activa ──
+            def _reconectar_data_frame():
+                """Reconectar el data_frame si fue destruido al cerrar el visor."""
+                nonlocal data_frame
+                try:
+                    data_frame.evaluate("() => true")
+                    return True  # sigue vivo
+                except:
+                    pass
+                # Buscar el frame del listado nuevamente
+                for fr in page.frames:
+                    try:
+                        if fr.evaluate("() => /Pendiente de recibir Informaci|Devoluci[oó]n de entrada/i.test(document.body?.innerText || '')"):
+                            data_frame = fr
+                            return True
+                    except:
+                        continue
+                return False
+
             def _procesar_lista(lista, intento_num):
                 fallidas = []
                 for idx, fac in enumerate(lista, 1):
@@ -1315,6 +1354,11 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                             generar_zip_parcial()
                         return None
                     log(f"[Intento {intento_num}][{idx}/{len(lista)}] Factura {fac['num']} ({fac['tipo']})...")
+                    # Reconectar data_frame si fue destruido por el visor
+                    if not _reconectar_data_frame():
+                        log(f"  ⚠️ data_frame perdido, reintentando en siguiente ciclo.", "warn")
+                        fallidas.append(fac)
+                        continue
                     try:
                         _download_factura(page, context, data_frame, fac, dl_dir, ips_nombre_actual)
                         with job_lock:
