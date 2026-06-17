@@ -1036,10 +1036,21 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             def _cerrar_popups():
                 try:
                     page.evaluate("""() => {
+                        // 1. Buscar específicamente el modal de Activa IT (Corte de Sistema, etc.)
+                        for (const el of document.querySelectorAll('*')) {
+                            const txt = el.innerText || '';
+                            if (/Corte de Sistema|mantenimiento|suspendido/i.test(txt) && el.offsetParent !== null) {
+                                const btns = [...el.querySelectorAll('button, a, input[type="button"]')];
+                                const close = btns.find(b => /cerrar|close|aceptar|ok|entendido|continuar/i.test(b.textContent || b.value || ''));
+                                if (close) { close.click(); return true; }
+                            }
+                        }
+                        // 2. Buscar cualquier modal/dialog visible genérico
                         const selectores = [
                             '.modal', '.dialog', '.alert', '.popup', '.overlay',
                             '[role="dialog"]', '[role="alertdialog"]',
-                            '.ui-dialog', '.sweet-alert', '.swal2-container'
+                            '.ui-dialog', '.sweet-alert', '.swal2-container',
+                            '.modal-dialog', '.modal-content'
                         ];
                         for (const sel of selectores) {
                             for (const el of document.querySelectorAll(sel)) {
@@ -1053,6 +1064,24 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     }""")
                 except:
                     pass
+                # También buscar en frames internos
+                for fr in page.frames:
+                    try:
+                        found = fr.evaluate("""() => {
+                            for (const el of document.querySelectorAll('*')) {
+                                const txt = el.innerText || '';
+                                if (/Corte de Sistema|mantenimiento|suspendido/i.test(txt) && el.offsetParent !== null) {
+                                    const btns = [...el.querySelectorAll('button, a, input[type="button"]')];
+                                    const close = btns.find(b => /cerrar|close|aceptar|ok/i.test(b.textContent || b.value || ''));
+                                    if (close) { close.click(); return true; }
+                                }
+                            }
+                            return false;
+                        }""")
+                        if found:
+                            break
+                    except:
+                        continue
                 try:
                     page.keyboard.press("Escape")
                 except:
