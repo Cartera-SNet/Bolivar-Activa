@@ -6,10 +6,11 @@
   },
   "deploy": {
     "numReplicas": 1,
-    "sleepApplication": false,
+    "sleepApplication": true,
     "healthCheckPath": "/",
     "RestartPolicy": {
-      "type": "Always"
+      "type": "ON_FAILURE",
+      "maxRetries": 3
     }
   }
 }
