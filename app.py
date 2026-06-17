@@ -34,6 +34,28 @@ DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ==================== MAPA DE IPS POR NIT ====================
+# Mapa directo usuario → NIT (más confiable que extraer dígitos del HTML)
+MAPA_USUARIO_NIT = {
+    "BOL470010090501": "900267064",
+    "BOL700010137801": "900513306",
+    "BOL130010259901": "900600550",
+    "BOL760010961401": "900631361",
+    "BOL760010961402": "900631361",
+    "BOL470010115401": "900657731",
+    "BOL470010128101": "900827065",
+    "BOL760011018701": "900847382",
+    "BOL130010284701": "900954800",
+    "BOL760010732306": "900257333",
+    "BOL760011009401": "900792417",
+    "BOL470010129901": "900826509",
+    "BOLIVAR90090075":  "900900754",
+    "BOL760011116801": "901081281",
+    "BOL768341116802": "901081281",
+    "BOLIVAR90116556": "901165560",
+    "BOLIVAR90116877": "901168777",
+    "BOL760010732307": "900257333",
+}
+
 MAPA_IPS = {
     "900267064": "INVERSIONES_AZALUD_CLINICA_BAHIA",
     "900827065": "CENTRO_DE_DIAGNOSTICO_E_IMAGENES_BAHIA",
@@ -361,6 +383,18 @@ def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
     """
     nombre = page.evaluate(js_nombre).strip() or target_frame.evaluate(js_nombre).strip()
     if not nombre:
+        # Último recurso: buscar en mapa de usuarios
+        nit_mapa = MAPA_USUARIO_NIT.get(page.evaluate("() => ''") or "")
+        # Intentar con el usuario actual via contexto
+        nombre_mapa = None
+        for usr, nit_u in MAPA_USUARIO_NIT.items():
+            if nit_u == nit or (nit_from_usuario and nit_u == nit_from_usuario):
+                if nit_u in MAPA_IPS:
+                    nombre_mapa = MAPA_IPS[nit_u]
+                    break
+        if nombre_mapa:
+            log(f"    🏥 IPS identificada por MAPA_USUARIO_NIT: {nombre_mapa}")
+            return nombre_mapa
         nombre = "IPS_DESCONOCIDA"
     nombre = re.sub(r'[\/*?:"<>|]', "", nombre).strip().replace(" ", "_")
     log(f"    🏥 IPS final: {nombre} (NIT: {nit})")
@@ -1154,9 +1188,9 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 raise Exception(f"No se pudo localizar el período '{periodo}' tras 60s.")
 
             log("🏥 Obteniendo nombre de la IPS...")
-            # Extraer NIT del usuario (ej: BOL760010961401 → 760010961401)
-            nit_from_usuario = re.search(r'(\d{9,12})', usuario)
-            nit_from_usuario = nit_from_usuario.group(1) if nit_from_usuario else None
+            # Extraer dígitos del usuario para buscar en MAPA_IPS
+            m = re.search(r'(\d{9,12})', usuario)
+            nit_from_usuario = m.group(1) if m else None
             if nit_from_usuario:
                 log(f"    🔑 NIT extraído del usuario '{usuario}': {nit_from_usuario}")
             ips_nombre_actual = _extraer_nombre_ips(page, target_frame, nit_usuario=nit_from_usuario)
