@@ -254,7 +254,7 @@ def generar_zip_parcial(job):
         return
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"facturas_{job["periodo"]}_PARCIAL_{timestamp}.zip"
+        zip_name = f'facturas_{job["periodo"]}_PARCIAL_{timestamp}.zip'
         zip_path = job["dl_dir"] / zip_name
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for archivo in archivos_a_incluir:
