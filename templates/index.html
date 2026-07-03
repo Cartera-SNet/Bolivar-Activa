@@ -857,7 +857,7 @@ document.getElementById("periodoCustom").addEventListener("input", function() {
     updatePathDisplay();
 });
 document.getElementById("downloadPath").addEventListener("input", updatePathDisplay);
-document.getElementById("uploadFile").addEventListener("change", () => document.getElementById("uploadFileName").textContent = this.files[0]?.name || "");
+document.getElementById("uploadFile").addEventListener("change", function() { document.getElementById("uploadFileName").textContent = this.files[0]?.name || ""; });
 
 // ── Job ──────────────────────────────────────────────────────────
 let polling = null, logCount = 0;
@@ -881,15 +881,24 @@ async function startJob() {
     logCount = 0;
     setStatus("running");
     document.getElementById("errorAlert").style.display = "none";
-    const data = await (await fetch("/api/start?q=1", {
-        method: "POST", headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ usuario: usr, password: pwd, periodo: per, download_path: dl })
-    })).json();
+
+    // Se envía el archivo de facturas (si sigue seleccionado) JUNTO con el
+    // arranque, para que el filtro quede aplicado de forma atómica y no
+    // dependa de una carga previa que pudo perderse si el servidor durmió.
+    const fd = new FormData();
+    fd.append("usuario", usr);
+    fd.append("password", pwd);
+    fd.append("periodo", per);
+    fd.append("download_path", dl);
+    const fi = document.getElementById("uploadFile").files[0];
+    if (fi) fd.append("file", fi);
+
+    const data = await (await fetch("/api/start?q=1", { method: "POST", body: fd })).json();
     if (!data.ok) { setStatus("error"); showError(data.error); document.getElementById("btnStart").disabled = false; return; }
     setEmpresaId(data.empresa_id);
     addLog({ts:"--:--:--", msg:`&#x1F680; Proceso iniciado | ${per} | Destino: ${data.download_path}`, level:"info"});
-    if (polling) clearInterval(polling);
-    polling = setInterval(pollStatus, 1500);
+    if (polling) clearTimeout(polling);
+    pollStatus();
 }
 
 async function pollStatus() {
@@ -900,13 +909,18 @@ async function pollStatus() {
         const s = await (await fetch(`/api/status?empresa_id=${encodeURIComponent(currentEmpresaId)}`)).json();
         updateStats(s.stats);
         if (!s.running) {
-            clearInterval(polling); polling = null;
+            polling = null;
             setStatus(s.error ? "error" : "done");
             if (s.error) showError(s.error);
             document.getElementById("btnStart").disabled = false;
             refreshFiles();
+            return;
         }
     } catch(e) { console.error(e); }
+    // Se reprograma el siguiente sondeo SOLO cuando este terminó por completo,
+    // en vez de usar setInterval (que podía disparar sondeos superpuestos y
+    // duplicar líneas del log si una respuesta tardaba más de 1.5s).
+    polling = setTimeout(pollStatus, 1500);
 }
 
 function updateStats(stats) {
@@ -998,7 +1012,7 @@ document.getElementById("btnReset").addEventListener("click", async () => {
     if (confirm(`&#x26A0; &#xBF;Reiniciar ${per}? Se borrar&#xE1; el progreso.`)) {
         await fetch("/api/reset", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ periodo: per, empresa_id: currentEmpresaId }) });
         clearLogs(); refreshFiles(); setStatus("idle"); document.getElementById("btnStart").disabled = false;
-        if (polling) { clearInterval(polling); polling = null; }
+        if (polling) { clearTimeout(polling); polling = null; }
         logCount = 0;
     }
 });

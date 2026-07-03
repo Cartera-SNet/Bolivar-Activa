@@ -1693,14 +1693,39 @@ def run_automation(job, usuario: str, password: str, periodo: str, download_path
             generar_zip_parcial(job)
     finally:
         with job["lock"]:
-            job["state"]["running"] = False
-            job["state"]["finished"] = True
-            job["state"]["stopping"] = False
+            if not job["state"].get("_lote_activo"):
+                job["state"]["running"] = False
+                job["state"]["finished"] = True
+                job["state"]["stopping"] = False
         job["browser"] = None
         job["context"] = None
         job["dl_dir"] = None
         job["periodo"] = None
         job["ips_nombre"] = None
+
+def run_automation_lote(job, usuario, password, periodos, download_path_base):
+    """Ejecuta run_automation secuencialmente para cada período de un rango
+    (ej: May26-Jun26 -> primero May26 completo, luego Jun26), en vez de
+    intentar buscar un período literal 'May26-Jun26' en el portal."""
+    with job["lock"]:
+        job["state"]["_lote_activo"] = True
+    try:
+        for idx, periodo in enumerate(periodos, 1):
+            if job["state"].get("stopping"):
+                log(job, "🛑 Rango detenido por el usuario antes de continuar con el siguiente período.", "warn")
+                break
+            log(job, f"{'='*50}")
+            log(job, f"📅 Período {idx}/{len(periodos)} del rango: {periodo}")
+            log(job, f"{'='*50}")
+            dl_path_periodo = str(Path(download_path_base) / periodo)
+            run_automation(job, usuario, password, periodo, dl_path_periodo)
+    finally:
+        with job["lock"]:
+            job["state"]["_lote_activo"] = False
+            job["state"]["running"] = False
+            job["state"]["finished"] = True
+            job["state"]["stopping"] = False
+        log(job, "🏁 Rango de períodos finalizado.")
 
 # ==================== RUTAS FLASK ====================
 @app.route("/")
@@ -1709,7 +1734,8 @@ def index():
 
 @app.route("/api/start", methods=["POST"])
 def start_job():
-    data = request.json or {}
+    is_multipart = request.content_type and "multipart/form-data" in request.content_type
+    data = request.form if is_multipart else (request.json or {})
     usuario = data.get("usuario", "").strip()
     password = data.get("password", "").strip()
     periodo_input = data.get("periodo", "").strip()
@@ -1723,6 +1749,20 @@ def start_job():
     empresa_id = resolve_empresa_id(usuario)
     job = get_or_create_job(empresa_id)
 
+    # Si se adjuntó el archivo de facturas junto con el arranque, se procesa
+    # AQUÍ MISMO (no depende de un /api/upload previo, cuyo resultado en
+    # memoria podría perderse si el contenedor entró en "sleep" mientras
+    # tanto). Esto hace que el filtro de facturas sea atómico con el inicio.
+    archivo_facturas = request.files.get("file") if is_multipart else None
+    facturas_nuevas = None
+    if archivo_facturas and archivo_facturas.filename:
+        try:
+            facturas_nuevas = parsear_archivo_facturas(archivo_facturas)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": f"Archivo de facturas: {e}"}), 400
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Error al procesar archivo de facturas: {e}"}), 500
+
     with jobs_registry_lock:
         with job["lock"]:
             if job["state"]["running"]:
@@ -1735,15 +1775,22 @@ def start_job():
             job["state"]["stats"] = {"total": 0, "descargadas": 0, "errores": 0}
             job["state"]["errores_detalle"] = []
             job["state"]["descargas_exitosas"] = []
+            if facturas_nuevas is not None:
+                job["state"]["facturas_permitidas"] = facturas_nuevas
+
+    if facturas_nuevas is not None:
+        log(job, f"📄 Filtro de {len(facturas_nuevas)} facturas aplicado junto con el arranque.")
+    elif job["state"].get("facturas_permitidas"):
+        log(job, f"📄 Usando filtro de {len(job['state']['facturas_permitidas'])} facturas cargado previamente.")
 
     dl_path = custom_path if custom_path else str(DOWNLOAD_DIR / periodo_input)
-    periodo_principal = periodos[0] if len(periodos) == 1 else periodo_input
     if len(periodos) > 1:
         log(job, f"📅 Procesando rango de {len(periodos)} períodos: {periodos[0]} → {periodos[-1]}")
         job["state"]["periodos_rango"] = periodos
+        t = threading.Thread(target=run_automation_lote, args=(job, usuario, password, periodos, dl_path), daemon=True)
     else:
         job["state"]["periodos_rango"] = None
-    t = threading.Thread(target=run_automation, args=(job, usuario, password, periodo_principal, dl_path), daemon=True)
+        t = threading.Thread(target=run_automation, args=(job, usuario, password, periodos[0], dl_path), daemon=True)
     t.start()
     return jsonify({"ok": True, "download_path": dl_path, "periodos_detectados": periodos, "empresa_id": empresa_id})
 
@@ -1909,6 +1956,50 @@ def get_periodos():
             periodos.append({"name": d.name, "count": count})
     return jsonify({"periodos": sorted(periodos, key=lambda x: x["name"], reverse=True)})
 
+def parsear_archivo_facturas(file_storage):
+    """Parsea un CSV/XLSX de facturas y devuelve la lista de números limpios.
+    Lanza ValueError con un mensaje amigable si algo sale mal."""
+    filename = file_storage.filename.lower()
+    facturas = []
+    if filename.endswith('.csv'):
+        raw = file_storage.read()
+        for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+            try:
+                csv_text = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            csv_text = raw.decode('latin-1', errors='replace')
+        reader = csv.DictReader(csv_text.splitlines())
+        for row in reader:
+            for col, val in row.items():
+                if 'factura' in col.lower():
+                    facturas.append(val.strip())
+                    break
+    elif filename.endswith(('.xls', '.xlsx')):
+        if not EXCEL_AVAILABLE:
+            raise ValueError("openpyxl no instalado")
+        wb = openpyxl.load_workbook(BytesIO(file_storage.read()), data_only=True)
+        ws = wb.active
+        col_idx = None
+        for cell in ws[1]:
+            if cell.value and 'factura' in str(cell.value).lower():
+                col_idx = cell.column
+                break
+        if col_idx is None:
+            raise ValueError("No se encontró columna con 'factura'")
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            val = row[col_idx-1]
+            if val:
+                facturas.append(str(val).strip())
+    else:
+        raise ValueError("Formato no soportado. Use CSV o Excel")
+    facturas_limpias = [re.sub(r'\D', '', f) for f in facturas if re.sub(r'\D', '', f)]
+    if not facturas_limpias:
+        raise ValueError("No se encontraron números de factura válidos")
+    return facturas_limpias
+
 @app.route("/api/upload", methods=["POST"])
 def upload_facturas():
     empresa_id = resolve_empresa_id(request.form.get("usuario", ""))
@@ -1919,49 +2010,13 @@ def upload_facturas():
     if file.filename == '':
         return jsonify({"ok": False, "error": "Archivo vacío"}), 400
     try:
-        filename = file.filename.lower()
-        facturas = []
-        if filename.endswith('.csv'):
-            raw = file.read()
-            for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
-                try:
-                    csv_text = raw.decode(enc)
-                    break
-                except (UnicodeDecodeError, LookupError):
-                    continue
-            else:
-                csv_text = raw.decode('latin-1', errors='replace')
-            reader = csv.DictReader(csv_text.splitlines())
-            for row in reader:
-                for col, val in row.items():
-                    if 'factura' in col.lower():
-                        facturas.append(val.strip())
-                        break
-        elif filename.endswith(('.xls', '.xlsx')):
-            if not EXCEL_AVAILABLE:
-                return jsonify({"ok": False, "error": "openpyxl no instalado"}), 500
-            wb = openpyxl.load_workbook(BytesIO(file.read()), data_only=True)
-            ws = wb.active
-            col_idx = None
-            for cell in ws[1]:
-                if cell.value and 'factura' in str(cell.value).lower():
-                    col_idx = cell.column
-                    break
-            if col_idx is None:
-                return jsonify({"ok": False, "error": "No se encontró columna con 'factura'"}), 400
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                val = row[col_idx-1]
-                if val:
-                    facturas.append(str(val).strip())
-        else:
-            return jsonify({"ok": False, "error": "Formato no soportado. Use CSV o Excel"}), 400
-        facturas_limpias = [re.sub(r'\D', '', f) for f in facturas if re.sub(r'\D', '', f)]
-        if not facturas_limpias:
-            return jsonify({"ok": False, "error": "No se encontraron números de factura válidos"}), 400
+        facturas_limpias = parsear_archivo_facturas(file)
         with job["lock"]:
             job["state"]["facturas_permitidas"] = facturas_limpias
-        log(job, f"📄 Se cargaron {len(facturas_limpias)} facturas desde el archivo.")
+        log(job, f"📄 Se cargaron {len(facturas_limpias)} facturas desde el archivo (vista previa).")
         return jsonify({"ok": True, "count": len(facturas_limpias), "facturas": facturas_limpias[:10]})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error al procesar archivo: {str(e)}"}), 500
 
