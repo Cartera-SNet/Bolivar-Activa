@@ -861,6 +861,12 @@ document.getElementById("uploadFile").addEventListener("change", () => document.
 
 // ── Job ──────────────────────────────────────────────────────────
 let polling = null, logCount = 0;
+let currentEmpresaId = localStorage.getItem("currentEmpresaId") || "";
+
+function setEmpresaId(id) {
+    currentEmpresaId = id || "";
+    if (currentEmpresaId) localStorage.setItem("currentEmpresaId", currentEmpresaId);
+}
 
 async function startJob() {
     const usr = document.getElementById("usuario").value.trim();
@@ -880,6 +886,7 @@ async function startJob() {
         body: JSON.stringify({ usuario: usr, password: pwd, periodo: per, download_path: dl })
     })).json();
     if (!data.ok) { setStatus("error"); showError(data.error); document.getElementById("btnStart").disabled = false; return; }
+    setEmpresaId(data.empresa_id);
     addLog({ts:"--:--:--", msg:`&#x1F680; Proceso iniciado | ${per} | Destino: ${data.download_path}`, level:"info"});
     if (polling) clearInterval(polling);
     polling = setInterval(pollStatus, 1500);
@@ -887,10 +894,10 @@ async function startJob() {
 
 async function pollStatus() {
     try {
-        const d = await (await fetch(`/api/logs?since=${logCount}`)).json();
+        const d = await (await fetch(`/api/logs?since=${logCount}&empresa_id=${encodeURIComponent(currentEmpresaId)}`)).json();
         d.logs.forEach(l => addLog(l));
         logCount += d.logs.length;
-        const s = await (await fetch("/api/status")).json();
+        const s = await (await fetch(`/api/status?empresa_id=${encodeURIComponent(currentEmpresaId)}`)).json();
         updateStats(s.stats);
         if (!s.running) {
             clearInterval(polling); polling = null;
@@ -939,7 +946,7 @@ function escHtml(s) { return s.replace(/&/g,"&").replace(/</g,"<").replace(/>/g,
 function clearLogs() {
     document.getElementById("logConsole").innerHTML = "";
     logCount = 0;
-    fetch('/api/logs', { method: 'DELETE' }).catch(console.error);
+    fetch(`/api/logs?empresa_id=${encodeURIComponent(currentEmpresaId)}`, { method: 'DELETE' }).catch(console.error);
 }
 
 async function deleteAllFiles() {
@@ -975,19 +982,21 @@ function fmtSize(b) { return b < 1024 ? b+" B" : b < 1048576 ? (b/1024).toFixed(
 document.getElementById("btnUpload").addEventListener("click", async () => {
     const fi = document.getElementById("uploadFile").files[0];
     if (!fi) { alert("Selecciona un archivo."); return; }
+    const usr = document.getElementById("usuario").value.trim();
     const fd = new FormData();
     fd.append("file", fi);
+    fd.append("usuario", usr);
     const d = await (await fetch("/api/upload", { method: "POST", body: fd })).json();
     const st = document.getElementById("uploadStatus");
     st.innerHTML = d.ok ? `<span style="color:var(--success);"><i class="fas fa-check-circle"></i> ${d.count} facturas.</span>` : `<span style="color:var(--error);">${d.error}</span>`;
 });
 
-document.getElementById("btnStop").addEventListener("click", async () => alert((await (await fetch("/api/stop", { method: "POST" })).json()).message));
+document.getElementById("btnStop").addEventListener("click", async () => alert((await (await fetch(`/api/stop?empresa_id=${encodeURIComponent(currentEmpresaId)}`, { method: "POST" })).json()).message));
 document.getElementById("btnReset").addEventListener("click", async () => {
     const per = document.getElementById("periodoCustom").value.trim();
     if (!per) return;
     if (confirm(`&#x26A0; &#xBF;Reiniciar ${per}? Se borrar&#xE1; el progreso.`)) {
-        await fetch("/api/reset", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ periodo: per }) });
+        await fetch("/api/reset", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ periodo: per, empresa_id: currentEmpresaId }) });
         clearLogs(); refreshFiles(); setStatus("idle"); document.getElementById("btnStart").disabled = false;
         if (polling) { clearInterval(polling); polling = null; }
         logCount = 0;
@@ -1019,7 +1028,7 @@ async function limpiarTodoPeriodo() {
     const per = document.getElementById("periodoCustom").value.trim();
     if (!per) return;
     if (confirm(`&#x26A0; &#xBF;Limpiar progreso de ${per}?`)) {
-        await fetch("/api/reset", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ periodo: per }) });
+        await fetch("/api/reset", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ periodo: per, empresa_id: currentEmpresaId }) });
         closeModal(); clearLogs(); refreshFiles(); setStatus("idle"); document.getElementById("btnStart").disabled = false;
     }
 }

@@ -80,24 +80,64 @@ MAPA_IPS = {
     "900847382": "CENTRO_MEDICO_Y_DE_REHABILITACION_VALLE_SALUD",
 }
 
-# ==================== ESTADO GLOBAL ====================
-job_state = {
-    "running": False,
-    "stopping": False,
-    "logs": [],
-    "stats": {"total": 0, "descargadas": 0, "errores": 0},
-    "finished": False,
-    "error": None,
-    "errores_detalle": [],
-    "descargas_exitosas": [],
-    "facturas_permitidas": [],
-}
-job_lock = threading.Lock()
-current_browser = None
-current_context = None
-current_dl_dir = None
-current_periodo = None
-current_ips_nombre = None
+# ==================== REGISTRO DE JOBS POR EMPRESA/IPS ====================
+# En vez de un único estado global compartido por todos los usuarios, cada
+# empresa (resuelta a partir del NIT del usuario que inicia sesión) tiene su
+# propio job aislado: su propio estado, su propio lock y su propio navegador.
+# Esto permite que dos empresas distintas corran en paralelo, mientras que la
+# MISMA empresa sigue bloqueada si ya tiene un proceso en curso.
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+
+jobs = {}  # empresa_id -> job dict
+jobs_registry_lock = threading.RLock()  # RLock: se puede re-adquirir en el mismo hilo sin bloquearse
+
+
+def resolve_empresa_id(usuario: str) -> str:
+    """Resuelve el identificador de 'empresa' a partir del usuario.
+    Dos usuarios distintos que pertenezcan al mismo NIT se tratan como la
+    MISMA empresa (comparten job/lock). Si el usuario no está en el mapa,
+    se usa el propio usuario como identificador (aislado)."""
+    u = (usuario or "").strip().upper()
+    return MAPA_USUARIO_NIT.get(u, u)
+
+
+def new_job_state():
+    return {
+        "running": False,
+        "stopping": False,
+        "logs": [],
+        "stats": {"total": 0, "descargadas": 0, "errores": 0},
+        "finished": False,
+        "error": None,
+        "errores_detalle": [],
+        "descargas_exitosas": [],
+        "facturas_permitidas": [],
+    }
+
+
+def get_or_create_job(empresa_id: str):
+    with jobs_registry_lock:
+        if empresa_id not in jobs:
+            jobs[empresa_id] = {
+                "state": new_job_state(),
+                "lock": threading.Lock(),
+                "browser": None,
+                "context": None,
+                "dl_dir": None,
+                "periodo": None,
+                "ips_nombre": None,
+            }
+        return jobs[empresa_id]
+
+
+def get_job_or_none(empresa_id: str):
+    with jobs_registry_lock:
+        return jobs.get(empresa_id)
+
+
+def count_running_jobs() -> int:
+    with jobs_registry_lock:
+        return sum(1 for j in jobs.values() if j["state"]["running"])
 
 # ==================== UTILIDADES DE PERÍODOS ====================
 MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
@@ -148,51 +188,42 @@ def parse_periodo_input(periodo_input):
     return []
 
 # ==================== LOGGING ====================
-def log(msg, level="info"):
+def log(job, msg, level="info"):
     ts = datetime.now().strftime("%H:%M:%S")
     entry = {"ts": ts, "msg": msg, "level": level}
-    with job_lock:
-        job_state["logs"].append(entry)
+    if job is not None:
+        with job["lock"]:
+            job["state"]["logs"].append(entry)
     if level == "error":
         logger.error(msg)
     else:
         logger.info(msg)
 
-def reset_state():
-    with job_lock:
-        job_state["running"] = False
-        job_state["stopping"] = False
-        job_state["logs"] = []
-        job_state["stats"] = {"total": 0, "descargadas": 0, "errores": 0}
-        job_state["finished"] = False
-        job_state["error"] = None
-        job_state["errores_detalle"] = []
-        job_state["descargas_exitosas"] = []
-        job_state["facturas_permitidas"] = []
+def reset_state(job):
+    with job["lock"]:
+        job["state"] = new_job_state()
 
-def stop_job():
-    global current_browser, current_context, current_dl_dir, current_periodo, current_ips_nombre
-    with job_lock:
-        job_state["stopping"] = True
-    log("🛑 Solicitando detención del proceso...", "warn")
-    if current_browser:
+def stop_job(job):
+    with job["lock"]:
+        job["state"]["stopping"] = True
+    log(job, "🛑 Solicitando detención del proceso...", "warn")
+    if job["browser"]:
         try:
-            current_browser.close()
-            log("  → Navegador cerrado por solicitud de stop.")
+            job["browser"].close()
+            log(job, "  → Navegador cerrado por solicitud de stop.")
         except Exception as e:
-            log(f"  → Error al cerrar navegador: {e}", "error")
-    generar_zip_parcial()
+            log(job, f"  → Error al cerrar navegador: {e}", "error")
+    generar_zip_parcial(job)
 
-def generar_zip_parcial():
-    global current_dl_dir, current_periodo, current_ips_nombre
-    if not current_dl_dir or not current_periodo or not current_ips_nombre:
+def generar_zip_parcial(job):
+    if not job["dl_dir"] or not job["periodo"] or not job["ips_nombre"]:
         return
-    ips_dir = current_dl_dir / current_ips_nombre
+    ips_dir = job["dl_dir"] / job["ips_nombre"]
     if not ips_dir.exists():
         return
-    with job_lock:
-        exitosas = job_state["descargas_exitosas"].copy()
-        errores = job_state["errores_detalle"].copy()
+    with job["lock"]:
+        exitosas = job["state"]["descargas_exitosas"].copy()
+        errores = job["state"]["errores_detalle"].copy()
     excel_parcial_path = None
     if EXCEL_AVAILABLE:
         try:
@@ -204,15 +235,15 @@ def generar_zip_parcial():
             ws_exit.title = "Descargadas"
             ws_exit.append(["N° Factura", "Estado", "IPS", "Archivo Descargado", "Fecha/Hora"])
             for ex in exitosas:
-                ws_exit.append([ex.get("factura"), ex.get("estado"), current_ips_nombre, ex.get("archivo"), ex.get("timestamp")])
+                ws_exit.append([ex.get("factura"), ex.get("estado"), job["ips_nombre"], ex.get("archivo"), ex.get("timestamp")])
             ws_err = wb.create_sheet("Errores")
             ws_err.append(["N° Factura", "Estado", "IPS", "Error", "Captura pantalla", "Fecha/Hora"])
             for err in errores:
-                ws_err.append([err.get("factura"), err.get("estado"), current_ips_nombre, err.get("error"), err.get("captura"), err.get("timestamp")])
+                ws_err.append([err.get("factura"), err.get("estado"), job["ips_nombre"], err.get("error"), err.get("captura"), err.get("timestamp")])
             wb.save(excel_parcial_path)
-            log(f"📊 Reporte Excel parcial generado: {excel_parcial_path}")
+            log(job, f"📊 Reporte Excel parcial generado: {excel_parcial_path}")
         except Exception as e:
-            log(f"⚠️ No se pudo generar Excel parcial: {e}", "warn")
+            log(job, f"⚠️ No se pudo generar Excel parcial: {e}", "warn")
     archivos_a_incluir = list(ips_dir.rglob("*.pdf"))
     if excel_parcial_path and excel_parcial_path.exists():
         archivos_a_incluir.append(excel_parcial_path)
@@ -223,17 +254,17 @@ def generar_zip_parcial():
         return
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"facturas_{current_periodo}_PARCIAL_{timestamp}.zip"
-        zip_path = current_dl_dir / zip_name
+        zip_name = f"facturas_{job["periodo"]}_PARCIAL_{timestamp}.zip"
+        zip_path = job["dl_dir"] / zip_name
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for archivo in archivos_a_incluir:
-                arcname = archivo.relative_to(current_dl_dir)
+                arcname = archivo.relative_to(job["dl_dir"])
                 zf.write(archivo, arcname=str(arcname))
-        log(f"📦 ZIP parcial generado: {zip_path}")
+        log(job, f"📦 ZIP parcial generado: {zip_path}")
     except Exception as e:
-        log(f"⚠️ No se pudo generar ZIP parcial: {e}", "warn")
+        log(job, f"⚠️ No se pudo generar ZIP parcial: {e}", "warn")
 
-def crear_zip_completo(dl_dir, periodo, ips_nombre):
+def crear_zip_completo(job, dl_dir, periodo, ips_nombre):
     try:
         zip_final_name = f"facturas_{periodo}.zip"
         zip_final_path = dl_dir / zip_final_name
@@ -249,13 +280,13 @@ def crear_zip_completo(dl_dir, periodo, ips_nombre):
                 if errores_dir.exists():
                     for err_file in errores_dir.rglob("*"):
                         zf.write(err_file, arcname=str(err_file.relative_to(dl_dir)))
-        log(f"📦 ZIP final generado: {zip_final_path}")
+        log(job, f"📦 ZIP final generado: {zip_final_path}")
         return str(zip_final_path)
     except Exception as e:
-        log(f"⚠️ No se pudo generar el ZIP final: {e}", "warn")
+        log(job, f"⚠️ No se pudo generar el ZIP final: {e}", "warn")
         return None
 
-def cargar_progreso(ips_dir):
+def cargar_progreso(job, ips_dir):
     progreso_path = ips_dir / "progreso.json"
     if progreso_path.exists():
         try:
@@ -264,17 +295,17 @@ def cargar_progreso(ips_dir):
                 completadas = data.get("completadas", [])
                 return set(completadas) if isinstance(completadas, list) else set()
         except Exception as e:
-            log(f"⚠️ Error al leer progreso: {e}", "warn")
+            log(job, f"⚠️ Error al leer progreso: {e}", "warn")
     return set()
 
-def guardar_progreso(ips_dir, completadas):
+def guardar_progreso(job, ips_dir, completadas):
     progreso_path = ips_dir / "progreso.json"
     try:
         data = {"completadas": list(completadas), "actualizado": datetime.now().isoformat()}
         with open(progreso_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        log(f"⚠️ Error al guardar progreso: {e}", "warn")
+        log(job, f"⚠️ Error al guardar progreso: {e}", "warn")
 
 def generar_reporte_excel(dl_dir, periodo, ips_nombre, exitosas, errores):
     if not EXCEL_AVAILABLE:
@@ -329,7 +360,7 @@ def _cerrar_traza_factura(page):
         except:
             continue
 
-def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
+def _extraer_nombre_ips(job, page, target_frame, nit_usuario=None):
     """
     Orden de prioridad:
     0. NIT extraído del nombre de usuario (ej: BOL760010961401 → 760010961401)
@@ -341,7 +372,7 @@ def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
     # 0. NIT del usuario directo
     if nit_usuario and nit_usuario in MAPA_IPS:
         nombre = MAPA_IPS[nit_usuario]
-        log(f"    🏥 IPS identificada por NIT del usuario ({nit_usuario}) -> {nombre}")
+        log(job, f"    🏥 IPS identificada por NIT del usuario ({nit_usuario}) -> {nombre}")
         return nombre
 
     def _buscar_en_frame(frame):
@@ -357,18 +388,18 @@ def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
                 nit = _buscar_en_frame(fr)
                 if nit:
                     break
-    log(f"    🔍 NIT detectado: {nit}")
+    log(job, f"    🔍 NIT detectado: {nit}")
 
     # Probar NIT del HTML contra el mapa
     if nit and nit in MAPA_IPS:
         nombre = MAPA_IPS[nit]
-        log(f"    🏥 Nombre obtenido del mapa: {nombre}")
+        log(job, f"    🏥 Nombre obtenido del mapa: {nombre}")
         return nombre
 
     # Probar NIT del usuario contra el mapa (segundo intento)
     if nit_usuario and nit_usuario in MAPA_IPS:
         nombre = MAPA_IPS[nit_usuario]
-        log(f"    🏥 IPS por NIT del usuario: {nombre}")
+        log(job, f"    🏥 IPS por NIT del usuario: {nombre}")
         return nombre
 
     js_nombre = """
@@ -388,20 +419,20 @@ def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
         # Intentar con el usuario actual via contexto
         nombre_mapa = None
         for usr, nit_u in MAPA_USUARIO_NIT.items():
-            if nit_u == nit or (nit_from_usuario and nit_u == nit_from_usuario):
+            if nit_u == nit or (nit_usuario and nit_u == nit_usuario):
                 if nit_u in MAPA_IPS:
                     nombre_mapa = MAPA_IPS[nit_u]
                     break
         if nombre_mapa:
-            log(f"    🏥 IPS identificada por MAPA_USUARIO_NIT: {nombre_mapa}")
+            log(job, f"    🏥 IPS identificada por MAPA_USUARIO_NIT: {nombre_mapa}")
             return nombre_mapa
         nombre = "IPS_DESCONOCIDA"
     nombre = re.sub(r'[\/*?:"<>|]', "", nombre).strip().replace(" ", "_")
-    log(f"    🏥 IPS final: {nombre} (NIT: {nit})")
+    log(job, f"    🏥 IPS final: {nombre} (NIT: {nit})")
     return nombre
 
 # ==================== FUNCIÓN DE DESCARGA CON ESPERA DEL CONTADOR ====================
-def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_nombre: str):
+def _download_factura(job, page, context, modal_frame, fac: dict, dl_dir: Path, ips_nombre: str):
     from PIL import Image
     import io
     import img2pdf
@@ -424,7 +455,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     dl_subdir.mkdir(parents=True, exist_ok=True)
 
     bot_id = fac.get("botId")
-    log(f"    🔗 Abriendo factura {num}...")
+    log(job, f"    🔗 Abriendo factura {num}...")
     num_solo_digitos = re.sub(r'\D', '', str(num))
 
     js_click_robusto = f"""
@@ -482,7 +513,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     try:
         result = modal_frame.evaluate(js_click_robusto)
     except Exception as e:
-        log(f"    ⚠️ Click falló: {e}", "warn")
+        log(job, f"    ⚠️ Click falló: {e}", "warn")
     if not result or not result.get("ok"):
         for fr in page.frames:
             try:
@@ -494,13 +525,13 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                 continue
     if not result or not result.get("ok"):
         raise Exception(f"Click totalmente fallido para factura {num}.")
-    log(f"    ✓ Click en factura {num} OK.")
+    log(job, f"    ✓ Click en factura {num} OK.")
     time.sleep(1.5)
 
     detalle_state = None
     detalle_frame = None
     for _ in range(60):
-        if job_state.get("stopping"): return
+        if job["state"].get("stopping"): return
 
         # ── Detectar modal "No se encontraron registros" ──
         for fr in page.frames:
@@ -511,7 +542,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                            /Buscador facturas|Información de la Facturas/i.test(txt);
                 }""")
                 if no_registros:
-                    log(f"    ⚠️ Modal 'No se encontraron registros' detectado para factura {num}. La factura no existe en el sistema.", "warn")
+                    log(job, f"    ⚠️ Modal 'No se encontraron registros' detectado para factura {num}. La factura no existe en el sistema.", "warn")
                     # Cerrar el modal si es posible
                     try:
                         fr.evaluate("""() => {
@@ -548,13 +579,13 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     if not detalle_frame:
         raise Exception("No apareció 'Traza de Factura' ni 'Adjuntos por Factura'.")
     time.sleep(1.5)
-    log(f"    ✅ Detalle abierto (modo: {detalle_state}).")
+    log(job, f"    ✅ Detalle abierto (modo: {detalle_state}).")
 
     if detalle_state == "traza":
-        log("    📑 Forzando cambio a pestaña 'Soportes'...")
+        log(job, "    📑 Forzando cambio a pestaña 'Soportes'...")
         supports_ok = False
         for intento in range(5):
-            if job_state.get("stopping"): return
+            if job["state"].get("stopping"): return
             for fr in page.frames:
                 try:
                     has_tabs = fr.evaluate(r"""() => /Factura.*Detalles.*Soportes/i.test((document.body?.innerText || '').replace(/\n/g, ' '))""")
@@ -573,14 +604,14 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                 break
             time.sleep(1)
         if not supports_ok:
-            log("    ⚠️ No se pudo clickear Soportes", "warn")
+            log(job, "    ⚠️ No se pudo clickear Soportes", "warn")
         else:
             time.sleep(3)
 
-    log("    ⏳ Esperando 'Adjuntos por Factura'...")
+    log(job, "    ⏳ Esperando 'Adjuntos por Factura'...")
     adjuntos_frame = None
     for _ in range(90):
-        if job_state.get("stopping"): return
+        if job["state"].get("stopping"): return
         for fr in page.frames:
             try:
                 if fr.evaluate("() => /Adjuntos por Factura|Buscar por.*Fecha/i.test(document.body?.innerText || '')"):
@@ -594,7 +625,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     if not adjuntos_frame:
         raise Exception("No se encontró sección 'Adjuntos por Factura'.")
     for _ in range(35):
-        if job_state.get("stopping"): return
+        if job["state"].get("stopping"): return
         try:
             if not adjuntos_frame.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')"):
                 break
@@ -602,7 +633,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
             pass
         time.sleep(1)
     time.sleep(1)
-    log("    ✅ Adjuntos cargados.")
+    log(job, "    ✅ Adjuntos cargados.")
 
     search_frame = adjuntos_frame
 
@@ -661,7 +692,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         """)
         # Espera dinámica: apenas "Procesando" desaparezca (max 20s)
         for _ in range(40):
-            if job_state.get("stopping"): return
+            if job["state"].get("stopping"): return
             processing = any(fr.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')") for fr in page.frames if fr)
             if not processing:
                 break
@@ -669,14 +700,14 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         # Pequeña pausa para estabilizar UI
         time.sleep(0.5)
 
-    log(f"    🔍 Buscando '{target_label}'...")
+    log(job, f"    🔍 Buscando '{target_label}'...")
     _escribir_buscador(target_label)
     archivo_seleccionado = False
     tipo_encontrado = None
     posibles_nombres = list({target_label, target_label_norm})
 
     for intento in range(4):
-        if job_state.get("stopping"): return
+        if job["state"].get("stopping"): return
         for fr in page.frames:
             try:
                 resultado = fr.evaluate(f"""
@@ -727,24 +758,24 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                     }}
                 """)
                 if resultado and resultado.get('ok'):
-                    log(f"    ✅ Selección realizada (método: {resultado.get('metodo')})")
+                    log(job, f"    ✅ Selección realizada (método: {resultado.get('metodo')})")
                     archivo_seleccionado = True
                     tipo_encontrado = nombre_soporte
                     break
             except Exception as e:
-                log(f"    ⚠️ Error en intento {intento+1}: {e}", "warn")
+                log(job, f"    ⚠️ Error en intento {intento+1}: {e}", "warn")
         if archivo_seleccionado:
             break
-        log(f"    🔄 Reintentando selección ({intento+1}/4)...")
+        log(job, f"    🔄 Reintentando selección ({intento+1}/4)...")
         time.sleep(0.8)
 
     if not archivo_seleccionado:
-        log(f"    ⚠️ No se encontró '{target_label}'. Intentando con 'Carta de'...")
+        log(job, f"    ⚠️ No se encontró '{target_label}'. Intentando con 'Carta de'...")
         texto_busqueda = "Carta de"
         _escribir_buscador(texto_busqueda)
         archivo_seleccionado = False
         for intento in range(4):
-            if job_state.get("stopping"): return
+            if job["state"].get("stopping"): return
             for fr in page.frames:
                 try:
                     resultado = fr.evaluate(f"""
@@ -795,30 +826,30 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                         }}
                     """)
                     if resultado and resultado.get('ok'):
-                        log(f"    ✅ Selección realizada con '{texto_busqueda}' (método: {resultado.get('metodo')})")
+                        log(job, f"    ✅ Selección realizada con '{texto_busqueda}' (método: {resultado.get('metodo')})")
                         archivo_seleccionado = True
                         tipo_encontrado = "CartaObjecion"
                         break
                 except Exception as e:
-                    log(f"    ⚠️ Error en intento {intento+1} para '{texto_busqueda}': {e}", "warn")
+                    log(job, f"    ⚠️ Error en intento {intento+1} para '{texto_busqueda}': {e}", "warn")
             if archivo_seleccionado:
                 break
-            log(f"    🔄 Reintentando '{texto_busqueda}' ({intento+1}/4)...")
+            log(job, f"    🔄 Reintentando '{texto_busqueda}' ({intento+1}/4)...")
             time.sleep(2)
 
     if not archivo_seleccionado:
         raise Exception(f"No se pudo seleccionar el archivo (intentó '{target_label}' y 'Carta de')")
 
-    log("    ⏳ Esperando confirmación de selección...")
+    log(job, "    ⏳ Esperando confirmación de selección...")
     for _ in range(20):
-        if job_state.get("stopping"): return
+        if job["state"].get("stopping"): return
         if not any(fr.evaluate("() => /Debe seleccionar por lo menos un documento/i.test(document.body?.innerText || '')") for fr in page.frames if fr):
-            log("    ✅ Selección confirmada")
+            log(job, "    ✅ Selección confirmada")
             break
         time.sleep(1)
 
     # ========== BOLÍVAR: ABRIR VISOR Y ESPERAR CONTADOR DE PÁGINAS ==========
-    log(f"    👁️ Abriendo visor documental...")
+    log(job, f"    👁️ Abriendo visor documental...")
     visor_page = None
     try:
         with context.expect_page(timeout=30000) as page_info:
@@ -827,7 +858,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                     btn = fr.locator('button[title="Abrir Documento"], button[aria-label="Abrir Documento"], button:has(i.fa-eye), button:has(i.bi-eye)').first
                     if btn.is_visible(timeout=5000):
                         btn.click()
-                        log("    ✅ Clic en botón 'Abrir Documento'")
+                        log(job, "    ✅ Clic en botón 'Abrir Documento'")
                         break
                 except:
                     pass
@@ -840,7 +871,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         start = time.time()
         ultimo_valor = None
         while time.time() - start < timeout:
-            if job_state.get("stopping"):
+            if job["state"].get("stopping"):
                 return None
             for fr in [frame] + frame.frames:
                 try:
@@ -859,20 +890,20 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
             time.sleep(0.5)
         return None
 
-    log("    ⏳ Esperando contador de páginas (ej. '1/11')...")
+    log(job, "    ⏳ Esperando contador de páginas (ej. '1/11')...")
     contador = _esperar_contador_paginas(visor_page, timeout=30)
     if not contador:
-        log("    ⚠️ No se detectó contador de páginas. Se usará método alternativo.", "warn")
+        log(job, "    ⚠️ No se detectó contador de páginas. Se usará método alternativo.", "warn")
         total_paginas = 1
         pagina_actual_esperada = 1
     else:
         pagina_actual_esperada, total_paginas = contador
-        log(f"    📄 Contador detectado: {pagina_actual_esperada}/{total_paginas}")
+        log(job, f"    📄 Contador detectado: {pagina_actual_esperada}/{total_paginas}")
 
     def _capturar_pagina_con_contador(frame, num_pagina_esperado, timeout=15):
         start = time.time()
         while time.time() - start < timeout:
-            if job_state.get("stopping"):
+            if job["state"].get("stopping"):
                 return None
             for fr in [frame] + frame.frames:
                 try:
@@ -926,29 +957,29 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
 
     imagenes_bytes = []
     if total_paginas == 1 and not contador:
-        log("    ⬇️ Intentando captura directa (sin contador)...")
+        log(job, "    ⬇️ Intentando captura directa (sin contador)...")
         img_bytes = _capturar_pagina_con_contador(visor_page, 1, timeout=10)
         if img_bytes:
             imagenes_bytes.append(img_bytes)
-            log("    ✅ Página capturada")
+            log(job, "    ✅ Página capturada")
         else:
-            log("    ⚠️ No se pudo capturar", "warn")
+            log(job, "    ⚠️ No se pudo capturar", "warn")
     else:
-        log(f"    ⬇️ Iniciando descarga de {total_paginas} página(s)...")
+        log(job, f"    ⬇️ Iniciando descarga de {total_paginas} página(s)...")
         for pagina in range(1, total_paginas + 1):
-            if job_state.get("stopping"): return
-            log(f"    📥 Esperando página {pagina}/{total_paginas}...")
+            if job["state"].get("stopping"): return
+            log(job, f"    📥 Esperando página {pagina}/{total_paginas}...")
             img_bytes = _capturar_pagina_con_contador(visor_page, pagina, timeout=20)
             if img_bytes:
                 imagenes_bytes.append(img_bytes)
-                log(f"    ✅ Página {pagina} capturada ({len(img_bytes)} bytes)")
+                log(job, f"    ✅ Página {pagina} capturada ({len(img_bytes)} bytes)")
             else:
-                log(f"    ⚠️ No se pudo capturar página {pagina}", "warn")
+                log(job, f"    ⚠️ No se pudo capturar página {pagina}", "warn")
                 if pagina < total_paginas:
                     _avanzar_pagina(visor_page)
                     time.sleep(2)
             if pagina < total_paginas:
-                log(f"    ➡️ Avanzando a página {pagina+1}...")
+                log(job, f"    ➡️ Avanzando a página {pagina+1}...")
                 _avanzar_pagina(visor_page)
                 time.sleep(1)
 
@@ -960,7 +991,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     if not imagenes_bytes:
         raise Exception(f"No se capturó ninguna imagen para la factura {num}")
 
-    log(f"    📦 Consolidando {len(imagenes_bytes)} imagen(es) en PDF...")
+    log(job, f"    📦 Consolidando {len(imagenes_bytes)} imagen(es) en PDF...")
     soporte_encontrado = tipo_encontrado if tipo_encontrado else nombre_soporte
     safe_name = re.sub(r"[^\w\-_.]", "_", f"{num}_{soporte_encontrado}.pdf")
     out_path = dl_subdir / safe_name
@@ -968,19 +999,19 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     try:
         with open(out_path, "wb") as f:
             f.write(img2pdf.convert(imagenes_bytes))
-        log(f"    💾 PDF guardado: {out_path.name} ({out_path.stat().st_size // 1024} KB)")
+        log(job, f"    💾 PDF guardado: {out_path.name} ({out_path.stat().st_size // 1024} KB)")
     except Exception as e:
-        log(f"    ⚠️ img2pdf falló, usando PIL: {e}", "warn")
+        log(job, f"    ⚠️ img2pdf falló, usando PIL: {e}", "warn")
         try:
             pil_images = [Image.open(io.BytesIO(img)).convert('RGB') for img in imagenes_bytes]
             if pil_images:
                 pil_images[0].save(str(out_path), save_all=True, append_images=pil_images[1:])
-                log(f"    💾 PDF guardado (PIL): {out_path.name}")
+                log(job, f"    💾 PDF guardado (PIL): {out_path.name}")
         except Exception as e2:
             raise Exception(f"No se pudo consolidar PDF: {e2}")
 
-    with job_lock:
-        job_state["descargas_exitosas"].append({
+    with job["lock"]:
+        job["state"]["descargas_exitosas"].append({
             "factura": num,
             "estado": fac["estado"],
             "archivo": str(out_path),
@@ -1029,27 +1060,26 @@ def _avanzar_pagina(page):
         return False
 
 # ==================== AUTOMATIZACIÓN PRINCIPAL ====================
-def run_automation(usuario: str, password: str, periodo: str, download_path: str):
+def run_automation(job, usuario: str, password: str, periodo: str, download_path: str):
     from playwright.sync_api import sync_playwright
-    global current_browser, current_context, current_dl_dir, current_periodo, current_ips_nombre
 
     dl_dir = Path(download_path)
     dl_dir.mkdir(parents=True, exist_ok=True)
     ips_nombre_actual = "IPS_SIN_NOMBRE"
     zip_parcial_generado = False
-    current_dl_dir = dl_dir
-    current_periodo = periodo
+    job["dl_dir"] = dl_dir
+    job["periodo"] = periodo
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)  # Railway: headless=True
             context = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 900})
             page = context.new_page()
-            current_browser = browser
-            current_context = context
+            job["browser"] = browser
+            job["context"] = context
 
-            log("🔐 Iniciando sesión en Activa IT...")
-            if job_state.get("stopping"): return
+            log(job, "🔐 Iniciando sesión en Activa IT...")
+            if job["state"].get("stopping"): return
             page.goto("https://activa-it.net/Login.aspx", wait_until="networkidle", timeout=60000)
             page.fill('input[placeholder="Usuario"]', usuario)
             page.fill('input[placeholder="Contraseña"]', password)
@@ -1122,10 +1152,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     pass
 
             _cerrar_popups()
-            log("✅ Sesión iniciada correctamente.")
-            if job_state.get("stopping"): return
+            log(job, "✅ Sesión iniciada correctamente.")
+            if job["state"].get("stopping"): return
 
-            log("📂 Navegando a módulo BI IPS...")
+            log(job, "📂 Navegando a módulo BI IPS...")
 
             def _find_periodo_in_frames():
                 js_check = f"""() => {{ const body = (document.body?.innerText || '').toLowerCase(); return body.includes('{periodo.lower()}') || ['abr26','abr-26','abr.26','abr/26','abr2026'].some(v => body.includes(v)); }}"""
@@ -1137,13 +1167,13 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                         continue
                 return None
 
-            if job_state.get("stopping"): return
+            if job["state"].get("stopping"): return
             clicked = False
             for intento in range(3):
                 try:
                     page.locator("text=BI IPS").first.click(timeout=15000)
                     clicked = True
-                    log("  ✓ Click directo en 'BI IPS' OK.")
+                    log(job, "  ✓ Click directo en 'BI IPS' OK.")
                     break
                 except:
                     pass
@@ -1152,7 +1182,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     time.sleep(1)
                     page.click("text=BI IPS", timeout=8000)
                     clicked = True
-                    log("  ✓ Click vía 'Inteligencia de Negocio' + 'BI IPS' OK.")
+                    log(job, "  ✓ Click vía 'Inteligencia de Negocio' + 'BI IPS' OK.")
                     break
                 except:
                     pass
@@ -1161,10 +1191,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     time.sleep(2)
                     page.click("text=BI IPS", timeout=8000)
                     clicked = True
-                    log("  ✓ Click vía hamburguesa + 'BI IPS' OK.")
+                    log(job, "  ✓ Click vía hamburguesa + 'BI IPS' OK.")
                     break
                 except Exception as e:
-                    log(f"    ⚠️ Intento {intento+1} falló: {e}", "warn")
+                    log(job, f"    ⚠️ Intento {intento+1} falló: {e}", "warn")
                     time.sleep(2)
             if not clicked:
                 raise Exception("No se encontró el módulo BI IPS en el menú.")
@@ -1175,29 +1205,29 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             except:
                 pass
             _cerrar_popups()
-            log("✅ Módulo BI IPS abierto. Buscando período...")
+            log(job, "✅ Módulo BI IPS abierto. Buscando período...")
             target_frame = None
             for i in range(120):
-                if job_state.get("stopping"): return
+                if job["state"].get("stopping"): return
                 target_frame = _find_periodo_in_frames()
                 if target_frame:
-                    log(f"✅ Período '{periodo}' detectado tras {(i+1)*0.5:.1f}s.")
+                    log(job, f"✅ Período '{periodo}' detectado tras {(i+1)*0.5:.1f}s.")
                     break
                 time.sleep(0.5)
             if not target_frame:
                 raise Exception(f"No se pudo localizar el período '{periodo}' tras 60s.")
 
-            log("🏥 Obteniendo nombre de la IPS...")
+            log(job, "🏥 Obteniendo nombre de la IPS...")
             # Extraer dígitos del usuario para buscar en MAPA_IPS
             m = re.search(r'(\d{9,12})', usuario)
             nit_from_usuario = m.group(1) if m else None
             if nit_from_usuario:
-                log(f"    🔑 NIT extraído del usuario '{usuario}': {nit_from_usuario}")
-            ips_nombre_actual = _extraer_nombre_ips(page, target_frame, nit_usuario=nit_from_usuario)
-            current_ips_nombre = ips_nombre_actual
+                log(job, f"    🔑 NIT extraído del usuario '{usuario}': {nit_from_usuario}")
+            ips_nombre_actual = _extraer_nombre_ips(job, page, target_frame, nit_usuario=nit_from_usuario)
+            job["ips_nombre"] = ips_nombre_actual
 
-            if job_state.get("stopping"): return
-            log(f"📅 Click en columna Cant del período '{periodo}'...")
+            if job["state"].get("stopping"): return
+            log(job, f"📅 Click en columna Cant del período '{periodo}'...")
             click_result = target_frame.evaluate(f"""
                 () => {{
                     for (const row of document.querySelectorAll('tr')) {{
@@ -1217,17 +1247,17 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 }}
             """)
             if click_result.get("reason") == "cant_cero":
-                log(f"ℹ️ El período '{periodo}' tiene 0 facturas radicadas.", "warn")
+                log(job, f"ℹ️ El período '{periodo}' tiene 0 facturas radicadas.", "warn")
                 browser.close()
                 return
             if not click_result.get("ok"):
                 raise Exception(f"No se pudo hacer click en Cant de '{periodo}': {click_result.get('reason')}")
-            log(f"  → Click en Cant: {click_result.get('value')}")
+            log(job, f"  → Click en Cant: {click_result.get('value')}")
 
-            log("⏳ Esperando modal 'Listado de facturas recibidas'...")
+            log(job, "⏳ Esperando modal 'Listado de facturas recibidas'...")
             modal_frame = None
             for _ in range(60):
-                if job_state.get("stopping"): return
+                if job["state"].get("stopping"): return
                 for fr in page.frames:
                     try:
                         if fr.evaluate("() => /Listado de facturas recibidas/i.test(document.body?.innerText || '')"):
@@ -1241,10 +1271,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             if not modal_frame:
                 raise Exception("El modal 'Listado de facturas recibidas' no apareció.")
 
-            log("⏳ Esperando datos del listado...")
+            log(job, "⏳ Esperando datos del listado...")
             data_frame = None
             for _ in range(120):
-                if job_state.get("stopping"): return
+                if job["state"].get("stopping"): return
                 for fr in page.frames:
                     try:
                         if fr.evaluate("() => /Pendiente de recibir Informaci|Devoluci[oó]n de entrada/i.test(document.body?.innerText || '')"):
@@ -1256,14 +1286,14 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     break
                 time.sleep(0.5)
             if not data_frame:
-                log("⚠️ No se encontraron facturas con los estados objetivo.", "warn")
+                log(job, "⚠️ No se encontraron facturas con los estados objetivo.", "warn")
                 browser.close()
                 return
 
-            log(f"✅ Datos detectados en frame '{data_frame.name or '(main)'}'.")
+            log(job, f"✅ Datos detectados en frame '{data_frame.name or '(main)'}'.")
             time.sleep(2)
 
-            log("🔍 Extrayendo facturas (incluyendo números con #)...")
+            log(job, "🔍 Extrayendo facturas (incluyendo números con #)...")
             js_extract = r"""
             (state) => {
                 const ESTADOS = [
@@ -1319,17 +1349,17 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             facturas_acumuladas = []
             rondas_sin_nuevos = 0
             for ronda in range(20):
-                if job_state.get("stopping"): return
+                if job["state"].get("stopping"): return
                 try:
                     res = data_frame.evaluate(js_extract, extract_state)
                 except Exception as e:
-                    log(f"  ⚠️ Error en extracción ronda {ronda+1}: {e}", "warn")
+                    log(job, f"  ⚠️ Error en extracción ronda {ronda+1}: {e}", "warn")
                     res = {"nuevas": []}
                 nuevas = res.get("nuevas", [])
                 if nuevas:
                     facturas_acumuladas.extend(nuevas)
                     rondas_sin_nuevos = 0
-                    log(f"  Ronda {ronda+1}: +{len(nuevas)} (Total: {len(facturas_acumuladas)})")
+                    log(job, f"  Ronda {ronda+1}: +{len(nuevas)} (Total: {len(facturas_acumuladas)})")
                 else:
                     rondas_sin_nuevos += 1
                 extract_state["seen"] = list(set(extract_state["seen"] + [n["num"] for n in nuevas]))
@@ -1340,19 +1370,19 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 except:
                     pass
                 time.sleep(0.5)
-            log(f"📊 {len(facturas_acumuladas)} facturas detectadas.")
+            log(job, f"📊 {len(facturas_acumuladas)} facturas detectadas.")
             facturas_objetivo = facturas_acumuladas
 
             ips_dir = dl_dir / ips_nombre_actual
-            completadas = cargar_progreso(ips_dir)
+            completadas = cargar_progreso(job, ips_dir)
 
             facturas_pendientes = []
             for fac in facturas_objetivo:
                 if fac['num'] in completadas:
-                    log(f"⏭️ Factura {fac['num']} ya descargada, omitiendo.")
-                    with job_lock:
-                        job_state["stats"]["descargadas"] += 1
-                        job_state["descargas_exitosas"].append({
+                    log(job, f"⏭️ Factura {fac['num']} ya descargada, omitiendo.")
+                    with job["lock"]:
+                        job["state"]["stats"]["descargadas"] += 1
+                        job["state"]["descargas_exitosas"].append({
                             "factura": fac['num'],
                             "estado": fac['estado'],
                             "archivo": str(ips_dir / ("Auditada" if fac['tipo']=='auditada' else "Devolucion") / f"Factura_{fac['num']}_{('Envios_D' if fac['tipo']=='auditada' else 'ActaDevolucion')}.pdf"),
@@ -1361,32 +1391,32 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 else:
                     facturas_pendientes.append(fac)
 
-            with job_lock:
-                permitidas = job_state.get("facturas_permitidas", [])
+            with job["lock"]:
+                permitidas = job["state"].get("facturas_permitidas", [])
             if permitidas:
                 original_count = len(facturas_pendientes)
                 facturas_pendientes = [fac for fac in facturas_pendientes if fac['num'] in permitidas]
-                log(f"📋 Filtro activo: {len(facturas_pendientes)} de {original_count} facturas permitidas.")
+                log(job, f"📋 Filtro activo: {len(facturas_pendientes)} de {original_count} facturas permitidas.")
 
-            log(f"📋 Facturas pendientes: {len(facturas_pendientes)}")
-            with job_lock:
-                job_state["stats"]["total"] = len(facturas_pendientes) + job_state["stats"]["descargadas"]
-                job_state["stats"]["errores"] = 0
+            log(job, f"📋 Facturas pendientes: {len(facturas_pendientes)}")
+            with job["lock"]:
+                job["state"]["stats"]["total"] = len(facturas_pendientes) + job["state"]["stats"]["descargadas"]
+                job["state"]["stats"]["errores"] = 0
 
             cnt_aud = sum(1 for f in facturas_pendientes if f["tipo"] == "auditada")
             cnt_dev = sum(1 for f in facturas_pendientes if f["tipo"] == "devolucion")
-            log("📋 RESUMEN:")
-            log(f"  • Auditada: {cnt_aud}")
-            log(f"  • Devolucion: {cnt_dev}")
-            log(f"  TOTAL: {len(facturas_pendientes)}")
+            log(job, "📋 RESUMEN:")
+            log(job, f"  • Auditada: {cnt_aud}")
+            log(job, f"  • Devolucion: {cnt_dev}")
+            log(job, f"  TOTAL: {len(facturas_pendientes)}")
             if not facturas_pendientes:
-                log("ℹ️ No hay facturas pendientes.")
+                log(job, "ℹ️ No hay facturas pendientes.")
                 browser.close()
-                with job_lock:
-                    exitosas = job_state["descargas_exitosas"].copy()
-                    errores = job_state["errores_detalle"].copy()
+                with job["lock"]:
+                    exitosas = job["state"]["descargas_exitosas"].copy()
+                    errores = job["state"]["errores_detalle"].copy()
                 generar_reporte_excel(dl_dir, periodo, ips_nombre_actual, exitosas, errores)
-                crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
+                crear_zip_completo(job, dl_dir, periodo, ips_nombre_actual)
                 return
 
             # ── Función interna: procesar una lista de facturas en la sesión activa ──
@@ -1411,55 +1441,55 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             def _procesar_lista(lista, intento_num):
                 fallidas = []
                 for idx, fac in enumerate(lista, 1):
-                    if job_state.get("stopping"):
-                        log("🛑 Proceso detenido por el usuario.")
+                    if job["state"].get("stopping"):
+                        log(job, "🛑 Proceso detenido por el usuario.")
                         if not zip_parcial_generado:
-                            generar_zip_parcial()
+                            generar_zip_parcial(job)
                         return None
-                    log(f"[Intento {intento_num}][{idx}/{len(lista)}] Factura {fac['num']} ({fac['tipo']})...")
+                    log(job, f"[Intento {intento_num}][{idx}/{len(lista)}] Factura {fac['num']} ({fac['tipo']})...")
                     # Reconectar data_frame si fue destruido por el visor
                     if not _reconectar_data_frame():
-                        log(f"  ⚠️ data_frame perdido, reintentando en siguiente ciclo.", "warn")
+                        log(job, f"  ⚠️ data_frame perdido, reintentando en siguiente ciclo.", "warn")
                         fallidas.append(fac)
                         continue
                     try:
-                        _download_factura(page, context, data_frame, fac, dl_dir, ips_nombre_actual)
-                        with job_lock:
-                            job_state["stats"]["descargadas"] += 1
+                        _download_factura(job, page, context, data_frame, fac, dl_dir, ips_nombre_actual)
+                        with job["lock"]:
+                            job["state"]["stats"]["descargadas"] += 1
                         completadas.add(fac['num'])
-                        guardar_progreso(ips_dir, completadas)
-                        log(f"  ✅ Descargada: {fac['num']}", "success")
+                        guardar_progreso(job, ips_dir, completadas)
+                        log(job, f"  ✅ Descargada: {fac['num']}", "success")
                     except Exception as e:
                         error_msg = str(e)
                         # ── Error DEFINITIVO: la factura no existe en el sistema, no reintentar ──
                         es_definitivo = "no encontrada en el sistema" in error_msg
-                        with job_lock:
+                        with job["lock"]:
                             if "seleccionar el archivo" in error_msg:
                                 if fac['tipo'] == 'auditada':
                                     error_msg = f"No se encontró soporte Envios_D ni Carta de Objecion"
                                 else:
                                     error_msg = f"No se encontró soporte ActaDevolucion ni Carta de Objecion"
-                        log(f"  ⚠️ Error intento {intento_num}: {error_msg}", "error")
+                        log(job, f"  ⚠️ Error intento {intento_num}: {error_msg}", "error")
                         _cerrar_traza_factura(page)
                         time.sleep(1)
                         if es_definitivo:
                             # Registrar directo en el Excel, no reintentar
-                            with job_lock:
-                                nums_existentes = {er["factura"] for er in job_state["errores_detalle"]}
+                            with job["lock"]:
+                                nums_existentes = {er["factura"] for er in job["state"]["errores_detalle"]}
                                 if fac['num'] not in nums_existentes:
-                                    job_state["stats"]["errores"] += 1
-                                    job_state["errores_detalle"].append({
+                                    job["state"]["stats"]["errores"] += 1
+                                    job["state"]["errores_detalle"].append({
                                         "factura": fac['num'],
                                         "estado": fac['estado'],
                                         "error": "Factura no existe en el sistema (No se encontraron registros)",
                                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                         "captura": ""
                                     })
-                            log(f"  ⏭️ Factura {fac['num']} marcada como inexistente — no se reintentará.", "warn")
+                            log(job, f"  ⏭️ Factura {fac['num']} marcada como inexistente — no se reintentará.", "warn")
                         else:
-                            with job_lock:
+                            with job["lock"]:
                                 if intento_num == 1:
-                                    job_state["stats"]["errores"] += 1
+                                    job["state"]["stats"]["errores"] += 1
                             fallidas.append(fac)
                 return fallidas
 
@@ -1475,17 +1505,17 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             def _relogin_y_procesar(fallidas_lista, intento_num, espera_seg):
                 """Cierra browser, espera, hace login completo y reintenta solo las fallidas."""
                 nonlocal page, context, browser
-                log(f"🔒 Cerrando browser para reinicio completo (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
+                log(job, f"🔒 Cerrando browser para reinicio completo (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
                 try:
                     browser.close()
                 except:
                     pass
-                log(f"⏳ Esperando {espera_seg//60} minuto(s) antes de reiniciar...", "warn")
+                log(job, f"⏳ Esperando {espera_seg//60} minuto(s) antes de reiniciar...", "warn")
                 for _ in range(espera_seg):
-                    if job_state.get("stopping"):
+                    if job["state"].get("stopping"):
                         return None
                     time.sleep(1)
-                log(f"🔄 Reiniciando browser y sesión (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
+                log(job, f"🔄 Reiniciando browser y sesión (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
                 # Reutilizar el playwright (p) ya existente — no crear uno nuevo dentro del hilo
                 browser = p.chromium.launch(headless=True)
                 context = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 900})
@@ -1506,7 +1536,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     page.wait_for_selector("text=BI IPS, text=Inteligencia de Negocio", timeout=10000)
                 except:
                     pass
-                log("✅ Sesión reiniciada correctamente.")
+                log(job, "✅ Sesión reiniciada correctamente.")
                 # Navegar al módulo BI IPS
                 for _ in range(3):
                     try:
@@ -1523,10 +1553,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
 
                 # ── Reconstruir el listado de facturas (data_frame nuevo) ──
                 nonlocal data_frame
-                log("🔄 Reabriendo listado de facturas tras relogin...", "warn")
+                log(job, "🔄 Reabriendo listado de facturas tras relogin...", "warn")
                 target_frame_re = None
                 for _ in range(120):
-                    if job_state.get("stopping"): return None
+                    if job["state"].get("stopping"): return None
                     for fr in page.frames:
                         try:
                             if fr.evaluate(f"() => {{ for (const row of document.querySelectorAll('tr')) {{ const c = row.querySelectorAll('td'); if (c.length >= 3 && c[0].textContent.trim() === '{periodo}') return true; }} return false; }}"):
@@ -1538,7 +1568,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                         break
                     time.sleep(0.5)
                 if not target_frame_re:
-                    log("⚠️ No se pudo reabrir el período tras relogin.", "error")
+                    log(job, "⚠️ No se pudo reabrir el período tras relogin.", "error")
                     return fallidas_lista  # devolver como fallidas para el siguiente intento
 
                 # Click en Cant
@@ -1564,7 +1594,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 time.sleep(2)
                 nuevo_data = None
                 for _ in range(120):
-                    if job_state.get("stopping"): return None
+                    if job["state"].get("stopping"): return None
                     for fr in page.frames:
                         try:
                             if fr.evaluate("() => /Pendiente de recibir Informaci|Devoluci[oó]n de entrada/i.test(document.body?.innerText || '')"):
@@ -1577,34 +1607,34 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     time.sleep(0.5)
                 if nuevo_data:
                     data_frame = nuevo_data
-                    log("✅ Listado reabierto correctamente.")
+                    log(job, "✅ Listado reabierto correctamente.")
                     time.sleep(2)
                 else:
-                    log("⚠️ No se pudo reabrir el listado tras relogin.", "error")
+                    log(job, "⚠️ No se pudo reabrir el listado tras relogin.", "error")
                     return fallidas_lista
 
                 # Procesar fallidas con el data_frame nuevo
                 nums_fallidas = {f['num'] for f in fallidas_lista}
-                with job_lock:
-                    job_state["errores_detalle"] = [e for e in job_state["errores_detalle"] if e["factura"] not in nums_fallidas]
+                with job["lock"]:
+                    job["state"]["errores_detalle"] = [e for e in job["state"]["errores_detalle"] if e["factura"] not in nums_fallidas]
                 return _procesar_lista(fallidas_lista, intento_num)
 
             intento = 2
-            while fallidas and intento <= MAX_REINTENTOS and not job_state.get("stopping"):
+            while fallidas and intento <= MAX_REINTENTOS and not job["state"].get("stopping"):
                 nums_fallidas = {f['num'] for f in fallidas}
-                with job_lock:
-                    job_state["errores_detalle"] = [e for e in job_state["errores_detalle"] if e["factura"] not in nums_fallidas]
+                with job["lock"]:
+                    job["state"]["errores_detalle"] = [e for e in job["state"]["errores_detalle"] if e["factura"] not in nums_fallidas]
 
                 if intento <= 4:
                     # Intentos 2-4: reintento rápido sin cerrar browser
-                    log(f"🔄 {len(fallidas)} factura(s) con error. Reintentando sin cerrar sesión ({intento}/{MAX_REINTENTOS})...", "warn")
+                    log(job, f"🔄 {len(fallidas)} factura(s) con error. Reintentando sin cerrar sesión ({intento}/{MAX_REINTENTOS})...", "warn")
                     time.sleep(3)
                     fallidas_nuevo = _procesar_lista(fallidas, intento)
                 else:
                     # Intentos 5-7: esperar 5 min | Intento 8: esperar 10 min
                     espera = 600 if intento == MAX_REINTENTOS else 300
                     mins = espera // 60
-                    log(f"🔄 {len(fallidas)} factura(s) persisten. Reiniciando sesión completa ({intento}/{MAX_REINTENTOS}) — espera {mins} min...", "warn")
+                    log(job, f"🔄 {len(fallidas)} factura(s) persisten. Reiniciando sesión completa ({intento}/{MAX_REINTENTOS}) — espera {mins} min...", "warn")
                     fallidas_nuevo = _relogin_y_procesar(fallidas, intento, espera_seg=espera)
 
                 if fallidas_nuevo is None:
@@ -1618,10 +1648,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
 
             # ── Registrar errores persistentes al final ──
             if fallidas:
-                log(f"⛔ {len(fallidas)} factura(s) no pudieron descargarse tras {MAX_REINTENTOS} intentos.", "error")
-                with job_lock:
+                log(job, f"⛔ {len(fallidas)} factura(s) no pudieron descargarse tras {MAX_REINTENTOS} intentos.", "error")
+                with job["lock"]:
                     for fac in fallidas:
-                        nums_existentes = {e["factura"] for e in job_state["errores_detalle"]}
+                        nums_existentes = {e["factura"] for e in job["state"]["errores_detalle"]}
                         if fac['num'] not in nums_existentes:
                             error_info = {
                                 "factura": fac['num'],
@@ -1638,39 +1668,39 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                                 error_info["captura"] = str(cap_path)
                             except:
                                 pass
-                            job_state["errores_detalle"].append(error_info)
-                    job_state["stats"]["errores"] = len(job_state["errores_detalle"])
+                            job["state"]["errores_detalle"].append(error_info)
+                    job["state"]["stats"]["errores"] = len(job["state"]["errores_detalle"])
 
             browser.close()
-            with job_lock:
-                exitosas = job_state["descargas_exitosas"].copy()
-                errores = job_state["errores_detalle"].copy()
+            with job["lock"]:
+                exitosas = job["state"]["descargas_exitosas"].copy()
+                errores = job["state"]["errores_detalle"].copy()
             generar_reporte_excel(dl_dir, periodo, ips_nombre_actual, exitosas, errores)
-            crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
+            crear_zip_completo(job, dl_dir, periodo, ips_nombre_actual)
             if fallidas:
-                log(f"⚠️ Proceso completado con {len(fallidas)} factura(s) con error persistente. Ver Excel para detalle.")
+                log(job, f"⚠️ Proceso completado con {len(fallidas)} factura(s) con error persistente. Ver Excel para detalle.")
             else:
-                log("🎉 Proceso completado sin errores.")
+                log(job, "🎉 Proceso completado sin errores.")
 
     except Exception as e:
-        if not job_state.get("stopping"):
-            log(f"💥 Error crítico: {e}", "error")
-            with job_lock:
-                job_state["error"] = str(e)
+        if not job["state"].get("stopping"):
+            log(job, f"💥 Error crítico: {e}", "error")
+            with job["lock"]:
+                job["state"]["error"] = str(e)
         else:
-            log("Proceso detenido por el usuario.")
+            log(job, "Proceso detenido por el usuario.")
         if not zip_parcial_generado:
-            generar_zip_parcial()
+            generar_zip_parcial(job)
     finally:
-        with job_lock:
-            job_state["running"] = False
-            job_state["finished"] = True
-            job_state["stopping"] = False
-        current_browser = None
-        current_context = None
-        current_dl_dir = None
-        current_periodo = None
-        current_ips_nombre = None
+        with job["lock"]:
+            job["state"]["running"] = False
+            job["state"]["finished"] = True
+            job["state"]["stopping"] = False
+        job["browser"] = None
+        job["context"] = None
+        job["dl_dir"] = None
+        job["periodo"] = None
+        job["ips_nombre"] = None
 
 # ==================== RUTAS FLASK ====================
 @app.route("/")
@@ -1689,56 +1719,72 @@ def start_job():
     periodos = parse_periodo_input(periodo_input)
     if not periodos:
         return jsonify({"ok": False, "error": f"Formato de período inválido: '{periodo_input}'. Use MMMYY (ej: May26) o rango MMMYY-MMMYY"}), 400
-    with job_lock:
-        if job_state["running"]:
-            return jsonify({"ok": False, "error": "Ya hay un proceso en ejecución"}), 409
-        job_state["running"] = True
-        job_state["finished"] = False
-        job_state["error"] = None
-        job_state["stats"] = {"total": 0, "descargadas": 0, "errores": 0}
-        job_state["errores_detalle"] = []
-        job_state["descargas_exitosas"] = []
+
+    empresa_id = resolve_empresa_id(usuario)
+    job = get_or_create_job(empresa_id)
+
+    with jobs_registry_lock:
+        with job["lock"]:
+            if job["state"]["running"]:
+                return jsonify({"ok": False, "error": "Ya hay un proceso en ejecución para esta empresa/IPS. Espera a que termine antes de iniciar otro."}), 409
+            if count_running_jobs() >= MAX_CONCURRENT_JOBS:
+                return jsonify({"ok": False, "error": f"Se alcanzó el máximo de {MAX_CONCURRENT_JOBS} procesos simultáneos. Intenta de nuevo en unos minutos."}), 429
+            job["state"]["running"] = True
+            job["state"]["finished"] = False
+            job["state"]["error"] = None
+            job["state"]["stats"] = {"total": 0, "descargadas": 0, "errores": 0}
+            job["state"]["errores_detalle"] = []
+            job["state"]["descargas_exitosas"] = []
+
     dl_path = custom_path if custom_path else str(DOWNLOAD_DIR / periodo_input)
     periodo_principal = periodos[0] if len(periodos) == 1 else periodo_input
     if len(periodos) > 1:
-        log(f"📅 Procesando rango de {len(periodos)} períodos: {periodos[0]} → {periodos[-1]}")
-        job_state["periodos_rango"] = periodos
+        log(job, f"📅 Procesando rango de {len(periodos)} períodos: {periodos[0]} → {periodos[-1]}")
+        job["state"]["periodos_rango"] = periodos
     else:
-        job_state["periodos_rango"] = None
-    t = threading.Thread(target=run_automation, args=(usuario, password, periodo_principal, dl_path), daemon=True)
+        job["state"]["periodos_rango"] = None
+    t = threading.Thread(target=run_automation, args=(job, usuario, password, periodo_principal, dl_path), daemon=True)
     t.start()
-    return jsonify({"ok": True, "download_path": dl_path, "periodos_detectados": periodos})
+    return jsonify({"ok": True, "download_path": dl_path, "periodos_detectados": periodos, "empresa_id": empresa_id})
 
 @app.route("/api/stop", methods=["POST"])
 def stop_job_route():
-    with job_lock:
-        if not job_state["running"]:
+    empresa_id = resolve_empresa_id(request.json.get("empresa_id") if request.is_json else request.args.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
+    if not job:
+        return jsonify({"ok": False, "message": "No hay proceso en ejecución"}), 400
+    with job["lock"]:
+        if not job["state"]["running"]:
             return jsonify({"ok": False, "message": "No hay proceso en ejecución"}), 400
-    stop_job()
+    stop_job(job)
     return jsonify({"ok": True, "message": "Deteniendo proceso..."})
 
 @app.route("/api/reset", methods=["POST"])
 def reset_job_route():
     data = request.json or {}
     periodo = data.get("periodo", "").strip()
-    with job_lock:
-        if job_state["running"]:
-            stop_job()
-            time.sleep(2)
+    empresa_id = resolve_empresa_id(data.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
+    if job:
+        with job["lock"]:
+            if job["state"]["running"]:
+                stop_job(job)
+                time.sleep(2)
     if periodo:
         periodo_dir = DOWNLOAD_DIR / periodo
         if periodo_dir.exists():
             for progreso_file in periodo_dir.glob("*/progreso.json"):
                 try:
                     progreso_file.unlink()
-                    log(f"🗑️ Progreso eliminado: {progreso_file}")
+                    log(job, f"🗑️ Progreso eliminado: {progreso_file}")
                 except Exception as e:
-                    log(f"⚠️ Error al borrar {progreso_file}: {e}", "warn")
+                    log(job, f"⚠️ Error al borrar {progreso_file}: {e}", "warn")
         else:
-            log(f"⚠️ No existe la carpeta del período '{periodo}'.", "warn")
+            log(job, f"⚠️ No existe la carpeta del período '{periodo}'.", "warn")
     else:
-        log("⚠️ No se especificó período, no se borró progreso.", "warn")
-    reset_state()
+        log(job, "⚠️ No se especificó período, no se borró progreso.", "warn")
+    if job:
+        reset_state(job)
     return jsonify({"ok": True, "message": "Estado reiniciado y progreso eliminado."})
 
 @app.route("/api/clean", methods=["POST"])
@@ -1746,6 +1792,8 @@ def clean_downloads():
     data = request.json or {}
     periodo = data.get("periodo", "").strip()
     ips = data.get("ips", "").strip()
+    empresa_id = resolve_empresa_id(data.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
     if not periodo:
         return jsonify({"ok": False, "error": "Se requiere el parámetro 'periodo'"}), 400
     periodo_dir = DOWNLOAD_DIR / periodo
@@ -1757,7 +1805,7 @@ def clean_downloads():
                 shutil.rmtree(path)
                 return True
         except Exception as e:
-            log(f"⚠️ Error al eliminar {path}: {e}", "error")
+            log(job, f"⚠️ Error al eliminar {path}: {e}", "error")
             return False
         return False
     eliminados = []
@@ -1775,30 +1823,42 @@ def clean_downloads():
             eliminados.append(str(periodo_dir))
         else:
             return jsonify({"ok": False, "error": f""}), 500
-    log(f"🧹 Limpieza completa realizada: {', '.join(eliminados)}")
+    log(job, f"🧹 Limpieza completa realizada: {', '.join(eliminados)}")
     return jsonify({"ok": True, "message": f"Se eliminaron correctamente: {', '.join(eliminados)}", "eliminados": eliminados})
 
 @app.route("/api/status")
 def get_status():
-    with job_lock:
+    empresa_id = resolve_empresa_id(request.args.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
+    if not job:
+        return jsonify({"running": False, "finished": False, "error": None,
+                         "stats": {"total": 0, "descargadas": 0, "errores": 0}, "logs": []})
+    with job["lock"]:
         return jsonify({
-            "running": job_state["running"],
-            "finished": job_state["finished"],
-            "error": job_state["error"],
-            "stats": job_state["stats"],
-            "logs": job_state["logs"][-200:],
+            "running": job["state"]["running"],
+            "finished": job["state"]["finished"],
+            "error": job["state"]["error"],
+            "stats": job["state"]["stats"],
+            "logs": job["state"]["logs"][-200:],
         })
 
 @app.route("/api/logs")
 def get_logs():
     since = int(request.args.get("since", 0))
-    with job_lock:
-        return jsonify({"logs": job_state["logs"][since:]})
+    empresa_id = resolve_empresa_id(request.args.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
+    if not job:
+        return jsonify({"logs": []})
+    with job["lock"]:
+        return jsonify({"logs": job["state"]["logs"][since:]})
 
 @app.route("/api/logs", methods=["DELETE"])
 def clear_logs():
-    with job_lock:
-        job_state["logs"] = []
+    empresa_id = resolve_empresa_id(request.args.get("empresa_id", ""))
+    job = get_job_or_none(empresa_id)
+    if job:
+        with job["lock"]:
+            job["state"]["logs"] = []
     return jsonify({"ok": True})
 
 @app.route("/api/files")
@@ -1830,10 +1890,10 @@ def delete_all_files():
                     if sub.is_file() and sub.name != "progreso.json":
                         sub.unlink()
                         eliminados += 1
-        log(f"🗑️ Soportes eliminados: {eliminados} archivo(s) en '{folder}' (progreso conservado)")
+        log(None, f"🗑️ Soportes eliminados: {eliminados} archivo(s) en '{folder}' (progreso conservado)")
         return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} soporte(s). El progreso se conservó.", "eliminados": eliminados})
     except Exception as e:
-        log(f"⚠️ Error al eliminar soportes: {e}", "error")
+        log(None, f"⚠️ Error al eliminar soportes: {e}", "error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/downloads/<path:filename>")
@@ -1851,6 +1911,8 @@ def get_periodos():
 
 @app.route("/api/upload", methods=["POST"])
 def upload_facturas():
+    empresa_id = resolve_empresa_id(request.form.get("usuario", ""))
+    job = get_or_create_job(empresa_id)
     if 'file' not in request.files:
         return jsonify({"ok": False, "error": "No se envió ningún archivo"}), 400
     file = request.files['file']
@@ -1896,9 +1958,9 @@ def upload_facturas():
         facturas_limpias = [re.sub(r'\D', '', f) for f in facturas if re.sub(r'\D', '', f)]
         if not facturas_limpias:
             return jsonify({"ok": False, "error": "No se encontraron números de factura válidos"}), 400
-        with job_lock:
-            job_state["facturas_permitidas"] = facturas_limpias
-        log(f"📄 Se cargaron {len(facturas_limpias)} facturas desde el archivo.")
+        with job["lock"]:
+            job["state"]["facturas_permitidas"] = facturas_limpias
+        log(job, f"📄 Se cargaron {len(facturas_limpias)} facturas desde el archivo.")
         return jsonify({"ok": True, "count": len(facturas_limpias), "facturas": facturas_limpias[:10]})
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error al procesar archivo: {str(e)}"}), 500
